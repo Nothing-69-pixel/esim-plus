@@ -1,16 +1,16 @@
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional
 import httpx
 import re
-import time
 from datetime import datetime, timezone
 
 app = FastAPI(
     title="Tap SMS API",
-    description="Temporary phone numbers + SMS reader — powered by esimplus.me",
-    version="2.0.0",
+    description="Temporary phone numbers + SMS reader",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -28,7 +28,7 @@ app.add_middleware(
 BASE_URL = "https://esimplus.me"
 NUMBERS_PAGE = f"{BASE_URL}/temporary-numbers"
 
-# Full browser-like headers
+# ⭐ FIX: Removed 'br' from Accept-Encoding to avoid brotli decompression issues
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -37,12 +37,12 @@ HEADERS = {
     ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8,"
-        "application/signed-exchange;v=b3;q=0.7"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "max-age=0",
+    "Accept-Encoding": "gzip, deflate",  # ⭐ No br
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
@@ -53,103 +53,72 @@ HEADERS = {
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
     "DNT": "1",
-    "Cookie": "cookie-consent=analytics_cookies%3D1%26other_cookies%3D1; NEXT_LOCALE=en",
 }
 
-# Minimal headers for internal API
-API_HEADERS = {
-    "User-Agent": HEADERS["User-Agent"],
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Origin": BASE_URL,
-    "Referer": NUMBERS_PAGE,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Ch-Ua": HEADERS["Sec-Ch-Ua"],
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Cookie": HEADERS["Cookie"],
-}
+# Jina AI Reader — free proxy to bypass blocks
+JINA_PREFIX = "https://r.jina.ai/"
 
 TIMEOUT = 30.0
 
 
 # ==================================================================
-# ============ HTTP HELPERS ======================================
+# ============ HTTP FETCH (multi-strategy) =======================
 # ==================================================================
-async def fetch_html(url: str) -> str:
-    """Fetch HTML page with full browser headers."""
-    async with httpx.AsyncClient(
-        timeout=TIMEOUT,
-        follow_redirects=True,
-        headers=HEADERS,
-        http2=False,
-    ) as client:
-        try:
-            resp = await client.get(url)
-            if resp.status_code == 403:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access forbidden by upstream (esimplus.me blocked the request)",
-                )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Upstream error {resp.status_code}: {resp.text[:200]}",
-                )
-            return resp.text
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Upstream timed out")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
-
-
-async def fetch_json(url: str) -> Optional[dict]:
-    """Try to fetch JSON from internal API."""
-    async with httpx.AsyncClient(
-        timeout=TIMEOUT,
-        follow_redirects=True,
-        headers=API_HEADERS,
-        http2=False,
-    ) as client:
-        try:
+async def fetch_html(url: str) -> tuple:
+    """
+    Try multiple strategies to fetch a URL.
+    Returns (html_text, strategy_used).
+    """
+    # ---- Strategy 1: Direct fetch with proper headers ----
+    try:
+        async with httpx.AsyncClient(
+            timeout=TIMEOUT,
+            follow_redirects=True,
+            headers=HEADERS,
+        ) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
-                return resp.json()
-            return None
-        except Exception:
-            return None
+                text = resp.text
+                # Sanity check — real page should contain Next.js data
+                if "__next_f" in text or "temporary-numbers" in text:
+                    return text, "direct"
+    except Exception:
+        pass
 
+    # ---- Strategy 2: Jina AI Reader proxy ----
+    try:
+        jina_url = f"{JINA_PREFIX}{url}"
+        async with httpx.AsyncClient(
+            timeout=45.0,
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(
+                jina_url,
+                headers={
+                    "User-Agent": HEADERS["User-Agent"],
+                    "Accept": "text/plain, text/html, */*",
+                },
+            )
+            if resp.status_code == 200 and resp.text:
+                return resp.text, "jina_proxy"
+    except Exception:
+        pass
 
-async def try_internal_api() -> Optional[List[dict]]:
-    """
-    Try common Next.js internal API endpoints.
-    Return list of numbers if any works.
-    """
-    candidates = [
-        f"{BASE_URL}/api/temporary-numbers",
-        f"{BASE_URL}/api/v1/temporary-numbers",
-        f"{BASE_URL}/api/phone-numbers",
-        f"{BASE_URL}/api/v1/phone-numbers",
-        f"{BASE_URL}/api/numbers",
-    ]
+    # ---- Strategy 3: AllOrigins proxy ----
+    try:
+        allorigins = f"https://api.allorigins.win/raw?url={url}"
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            resp = await client.get(allorigins)
+            if resp.status_code == 200 and resp.text:
+                return resp.text, "allorigins_proxy"
+    except Exception:
+        pass
 
-    for url in candidates:
-        data = await fetch_json(url)
-        if data and isinstance(data, (list, dict)):
-            # Try to extract numbers from response
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                # Look for common keys
-                for key in ["data", "numbers", "items", "results"]:
-                    if key in data and isinstance(data[key], list):
-                        return data[key]
-        time.sleep(0.2)
-
-    return None
+    # ---- All failed ----
+    raise HTTPException(
+        status_code=502,
+        detail="All fetch strategies failed. Upstream may be blocking Vercel IPs.",
+    )
 
 
 # ==================================================================
@@ -241,15 +210,12 @@ async def root():
     return {
         "success": True,
         "service": "Tap SMS API",
-        "version": "2.0.0",
-        "backend": "esimplus.me",
+        "version": "3.0.0",
         "endpoints": {
             "numbers": "/api/numbers",
-            "numbers_by_country": "/api/numbers?country=US",
             "countries": "/api/countries",
-            "number_detail": "/api/number/{phone_number}",
-            "sms": "/api/sms/{phone_number}",
-            "sms_otp_only": "/api/sms/{phone_number}?otp_only=true",
+            "number_detail": "/api/number/{phone}",
+            "sms": "/api/sms/{phone}",
             "latest_otp": "/api/latest-otp",
             "debug": "/api/debug",
             "health": "/api/health",
@@ -262,51 +228,63 @@ async def root():
 # ==================================================================
 @app.get("/api/debug", tags=["System"])
 async def debug():
-    """
-    Test connectivity to esimplus.me with different approaches.
-    """
+    """Test connectivity to esimplus.me."""
     results = {}
 
-    # Test 1: Direct HTML fetch
+    # Strategy 1: Direct
     try:
         async with httpx.AsyncClient(
             timeout=15.0, follow_redirects=True, headers=HEADERS
         ) as client:
             r = await client.get(NUMBERS_PAGE)
-            results["html_fetch"] = {
+            results["direct"] = {
                 "status": r.status_code,
                 "size": len(r.text),
                 "has_next_data": "__next_f" in r.text,
-                "is_cloudflare": "cloudflare" in r.text.lower()[:2000],
+                "content_type": r.headers.get("content-type", ""),
+                "content_encoding": r.headers.get("content-encoding", ""),
             }
     except Exception as e:
-        results["html_fetch"] = {"error": str(e)}
+        results["direct"] = {"error": str(e)[:200]}
 
-    # Test 2: Internal API endpoints
-    api_tests = {}
-    candidates = [
-        f"{BASE_URL}/api/temporary-numbers",
-        f"{BASE_URL}/api/v1/temporary-numbers",
-        f"{BASE_URL}/api/phone-numbers",
-        f"{BASE_URL}/api/numbers",
-    ]
-    async with httpx.AsyncClient(
-        timeout=10.0, follow_redirects=True, headers=API_HEADERS
-    ) as client:
-        for url in candidates:
-            try:
-                r = await client.get(url)
-                api_tests[url] = {
-                    "status": r.status_code,
-                    "preview": r.text[:200],
-                }
-            except Exception as e:
-                api_tests[url] = {"error": str(e)}
+    # Strategy 2: Jina AI reader
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.get(f"{JINA_PREFIX}{NUMBERS_PAGE}")
+            results["jina"] = {
+                "status": r.status_code,
+                "size": len(r.text),
+                "preview": r.text[:300],
+            }
+    except Exception as e:
+        results["jina"] = {"error": str(e)[:200]}
 
-    results["api_tests"] = api_tests
+    # Strategy 3: AllOrigins
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.get(
+                f"https://api.allorigins.win/raw?url={NUMBERS_PAGE}"
+            )
+            results["allorigins"] = {
+                "status": r.status_code,
+                "size": len(r.text),
+                "has_next_data": "__next_f" in r.text,
+            }
+    except Exception as e:
+        results["allorigins"] = {"error": str(e)[:200]}
+
+    # Pick best strategy
+    best = None
+    if results.get("direct", {}).get("status") == 200 and results["direct"].get("has_next_data"):
+        best = "direct"
+    elif results.get("jina", {}).get("status") == 200:
+        best = "jina"
+    elif results.get("allorigins", {}).get("status") == 200:
+        best = "allorigins"
 
     return {
         "success": True,
+        "best_strategy": best,
         "results": results,
     }
 
@@ -316,10 +294,10 @@ async def debug():
 # ==================================================================
 @app.get("/api/numbers", tags=["SMS"])
 async def list_numbers(
-    country: str = Query(None, description="Filter by country code (US, CA, PR)"),
+    country: str = Query(None),
     limit: int = Query(200, ge=1, le=500),
 ):
-    html = await fetch_html(NUMBERS_PAGE)
+    html, strategy = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
 
     if country:
@@ -337,16 +315,17 @@ async def list_numbers(
         "success": True,
         "count": len(numbers),
         "by_country": by_country,
+        "fetch_strategy": strategy,
         "numbers": numbers,
     }
 
 
 # ==================================================================
-# ============ LIST COUNTRIES ====================================
+# ============ COUNTRIES =========================================
 # ==================================================================
 @app.get("/api/countries", tags=["SMS"])
 async def list_countries():
-    html = await fetch_html(NUMBERS_PAGE)
+    html, strategy = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
 
     by_country: Dict[str, dict] = {}
@@ -366,6 +345,7 @@ async def list_countries():
     return {
         "success": True,
         "count": len(countries),
+        "fetch_strategy": strategy,
         "countries": countries,
     }
 
@@ -379,18 +359,18 @@ async def number_detail(phone_number: str):
     if not phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    html = await fetch_html(NUMBERS_PAGE)
+    html, _ = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
     target = next((n for n in numbers if n["phone_number"] == phone), None)
 
     if not target:
         return {
             "success": False,
-            "message": f"Number {phone} not found in current listing",
+            "message": f"Number {phone} not found",
             "phone_number": phone,
         }
 
-    detail_html = await fetch_html(target["detail_url"])
+    detail_html, strategy = await fetch_html(target["detail_url"])
     sms = extract_sms_from_html(detail_html)
     total = extract_total_count(detail_html) or len(sms)
 
@@ -399,6 +379,7 @@ async def number_detail(phone_number: str):
         "number": target,
         "total_sms": total,
         "loaded_sms": len(sms),
+        "fetch_strategy": strategy,
         "sms": sms,
     }
 
@@ -416,18 +397,14 @@ async def get_sms(
     if not phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    html = await fetch_html(NUMBERS_PAGE)
+    html, _ = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
     target = next((n for n in numbers if n["phone_number"] == phone), None)
 
     if not target:
-        return {
-            "success": False,
-            "message": f"Number {phone} not found",
-            "phone_number": phone,
-        }
+        return {"success": False, "message": f"Number {phone} not found"}
 
-    detail_html = await fetch_html(target["detail_url"])
+    detail_html, strategy = await fetch_html(target["detail_url"])
     sms = extract_sms_from_html(detail_html)
     total = extract_total_count(detail_html) or len(sms)
 
@@ -444,6 +421,7 @@ async def get_sms(
         "total_sms": total,
         "otp_only": otp_only,
         "count": len(sms),
+        "fetch_strategy": strategy,
         "messages": sms,
     }
 
@@ -456,19 +434,19 @@ async def latest_otp(
     country: str = Query(None),
     limit: int = Query(20, ge=1, le=100),
 ):
-    html = await fetch_html(NUMBERS_PAGE)
+    html, _ = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
 
     if country:
         cc = country.upper()
         numbers = [n for n in numbers if n["country_code"] == cc]
 
-    numbers = numbers[:5]  # Only first 5 to avoid timeouts
+    numbers = numbers[:3]  # Only 3 to save time
 
     all_otps = []
     for n in numbers:
         try:
-            detail_html = await fetch_html(n["detail_url"])
+            detail_html, _ = await fetch_html(n["detail_url"])
             sms = extract_sms_from_html(detail_html)
             for m in sms:
                 if m["otp_codes"]:
@@ -504,7 +482,7 @@ async def health():
         "success": True,
         "status": "healthy",
         "backend": "esimplus.me",
-        "version": "2.0.0",
+        "version": "3.0.0",
     }
 
 
