@@ -5,12 +5,13 @@ from typing import List, Dict, Optional
 import httpx
 import re
 import asyncio
+import socket
 from datetime import datetime, timezone
 
 app = FastAPI(
     title="Tap SMS API",
     description="Free temporary phone numbers + SMS reader",
-    version="5.0.0",
+    version="6.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -24,8 +25,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ SOURCES ============
-OTP_API = "https://otp-api.shelex.dev/api"
+# ============ SOURCES (multi-fallback) ============
+SOURCES = [
+    "https://otp-api.shelex.dev/api",
+    "https://otp-api.onrender.com/api",       # backup 1
+]
 
 HEADERS = {
     "User-Agent": (
@@ -35,73 +39,104 @@ HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "close",
 }
 
 TIMEOUT = 20.0
-MAX_RETRIES = 3
 
 
 # ==================================================================
-# ============ ROBUST HTTP WITH RETRY ============================
+# ============ IPv4-FORCED TRANSPORT =============================
 # ==================================================================
-async def robust_get(url: str, params: dict = None, retries: int = MAX_RETRIES) -> Optional[httpx.Response]:
+def ipv4_transport() -> httpx.AsyncHTTPTransport:
     """
-    GET with retry and exponential backoff.
-    Handles DNS/network errors gracefully.
+    Force IPv4 for all DNS resolutions.
+    Fixes 'Device or resource busy' on some Vercel environments.
     """
-    last_error = None
+    return httpx.AsyncHTTPTransport(
+        retries=2,
+        local_address="0.0.0.0",  # Force IPv4
+    )
 
-    for attempt in range(retries):
-        try:
-            # Fresh client each time (avoids connection pool issues)
-            async with httpx.AsyncClient(
-                timeout=TIMEOUT,
-                follow_redirects=True,
-                headers=HEADERS,
-                limits=httpx.Limits(max_keepalive_connections=0, max_connections=5),
-            ) as client:
-                resp = await client.get(url, params=params)
-                return resp
-        except (httpx.ConnectError, httpx.NetworkError, OSError) as e:
-            last_error = str(e)[:150]
-            if attempt < retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))  # 1s, 2s backoff
-            continue
-        except httpx.TimeoutException as e:
-            last_error = f"Timeout: {str(e)[:100]}"
-            if attempt < retries - 1:
-                await asyncio.sleep(1)
-            continue
-        except Exception as e:
-            last_error = str(e)[:150]
-            break
+
+async def robust_get(url: str, params: dict = None, timeout: float = TIMEOUT) -> Optional[httpx.Response]:
+    """
+    Robust GET with IPv4 forcing and multiple retry strategies.
+    """
+    # Attempt 1: IPv4-forced
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=HEADERS,
+            transport=ipv4_transport(),
+        ) as client:
+            return await client.get(url, params=params)
+    except Exception as e1:
+        pass
+
+    # Attempt 2: Default (no transport override)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=HEADERS,
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
+            return await client.get(url, params=params)
+    except Exception as e2:
+        pass
+
+    # Attempt 3: http2 disabled + explicit close
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=HEADERS,
+            http2=False,
+        ) as client:
+            resp = await client.get(url, params=params)
+            return resp
+    except Exception as e3:
+        pass
 
     return None
 
 
-async def otp_fetch(path: str, params: dict = None) -> dict:
-    """Fetch from OTP API with retry."""
-    url = f"{OTP_API}{path}"
-    resp = await robust_get(url, params=params)
+async def try_all_sources(path: str, params: dict = None) -> tuple:
+    """
+    Try path on all source APIs.
+    Returns (data, source_used) or raises HTTPException.
+    """
+    errors = []
 
-    if resp is None:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not reach OTP aggregator (network/DNS issue)",
-        )
+    for source in SOURCES:
+        url = f"{source}{path}"
+        resp = await robust_get(url, params=params)
 
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"Aggregator error {resp.status_code}: {resp.text[:200]}",
-        )
+        if resp is None:
+            errors.append({"source": source, "error": "network failure"})
+            continue
 
-    try:
-        return resp.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail="Invalid JSON from aggregator")
+        if resp.status_code == 200:
+            try:
+                return resp.json(), source
+            except Exception:
+                errors.append({"source": source, "error": "invalid JSON"})
+                continue
+
+        errors.append({
+            "source": source,
+            "status": resp.status_code,
+            "error": resp.text[:100],
+        })
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "message": "All sources failed",
+            "errors": errors,
+        },
+    )
 
 
 # ==================================================================
@@ -112,59 +147,67 @@ async def root():
     return {
         "success": True,
         "service": "Tap SMS API",
-        "version": "5.0.0",
-        "backend": "otp-api.shelex.dev",
+        "version": "6.0.0",
+        "sources": SOURCES,
         "endpoints": {
+            "test": "/api/test",
+            "health": "/api/health",
             "countries": "/api/countries",
             "numbers": "/api/numbers?country=USA",
             "otp": "/api/otp/{country}/{phone}",
-            "sms": "/api/sms/{country}/{phone}",
-            "health": "/api/health",
-            "test": "/api/test",
         },
     }
 
 
 # ==================================================================
-# ============ TEST ENDPOINT (no external call) ==================
+# ============ DNS RESOLVE TEST ==================================
 # ==================================================================
+def resolve_hostname(hostname: str) -> dict:
+    """Resolve hostname to IPv4/IPv6 addresses."""
+    result = {"hostname": hostname, "ipv4": [], "ipv6": [], "error": None}
+    try:
+        infos = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+        for info in infos:
+            family, _, _, _, addr = info
+            if family == socket.AF_INET:
+                result["ipv4"].append(addr[0])
+            elif family == socket.AF_INET6:
+                result["ipv6"].append(addr[0])
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    return result
+
+
 @app.get("/api/test", tags=["System"])
 async def test():
-    """
-    Test the basic HTTP connectivity without hitting OTP API.
-    Uses a reliable endpoint to verify DNS/network works.
-    """
+    """Test DNS + network with different approaches."""
     results = {}
 
-    # Test 1: Google DNS
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get("https://www.google.com/generate_204")
-            results["google"] = {"status": r.status_code, "ok": r.status_code in (200, 204)}
-    except Exception as e:
-        results["google"] = {"error": str(e)[:100]}
+    # Test DNS resolution
+    results["dns_google"] = resolve_hostname("www.google.com")
+    results["dns_cloudflare"] = resolve_hostname("1.1.1.1")
+    results["dns_otp_api"] = resolve_hostname("otp-api.shelex.dev")
 
-    # Test 2: Cloudflare
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get("https://1.1.1.1/cdn-cgi/trace")
-            results["cloudflare"] = {"status": r.status_code, "ok": r.status_code == 200}
-    except Exception as e:
-        results["cloudflare"] = {"error": str(e)[:100]}
+    # Test HTTP connections
+    async def test_url(url, name):
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                transport=ipv4_transport(),
+                headers=HEADERS,
+            ) as client:
+                r = await client.get(url)
+                return {"status": r.status_code, "ok": r.status_code < 500, "size": len(r.text)}
+        except Exception as e:
+            return {"error": str(e)[:150]}
 
-    # Test 3: OTP API countries
-    try:
-        async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
-            r = await client.get(f"{OTP_API}/countries")
-            results["otp_api"] = {
-                "status": r.status_code,
-                "size": len(r.text),
-                "ok": r.status_code == 200,
-            }
-    except Exception as e:
-        results["otp_api"] = {"error": str(e)[:150]}
+    results["http_google"] = await test_url("https://www.google.com/generate_204", "google")
+    results["http_otp_api"] = await test_url("https://otp-api.shelex.dev/api/countries", "otp_api")
 
-    all_ok = all(r.get("ok", False) for r in results.values())
+    all_ok = (
+        results["http_google"].get("ok", False)
+        and results["http_otp_api"].get("ok", False)
+    )
 
     return {
         "success": True,
@@ -178,22 +221,26 @@ async def test():
 # ==================================================================
 @app.get("/api/health", tags=["System"])
 async def health():
-    """Quick health check."""
+    """Check aggregator reachability."""
     try:
-        async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
-            r = await client.get(f"{OTP_API}/countries")
+        resp = await robust_get(f"{SOURCES[0]}/countries", timeout=10.0)
+        if resp and resp.status_code == 200:
             return {
                 "success": True,
-                "status": "healthy" if r.status_code == 200 else "degraded",
-                "aggregator_status": r.status_code,
-                "aggregator_size": len(r.text),
+                "status": "healthy",
+                "source": SOURCES[0],
             }
+        return {
+            "success": False,
+            "status": "unreachable",
+            "source": SOURCES[0],
+            "error": resp.text[:200] if resp else "no response",
+        }
     except Exception as e:
         return {
             "success": False,
             "status": "unreachable",
             "error": str(e)[:200],
-            "hint": "Try /api/test to diagnose DNS/network",
         }
 
 
@@ -202,9 +249,10 @@ async def health():
 # ==================================================================
 @app.get("/api/countries", tags=["SMS"])
 async def list_countries():
-    data = await otp_fetch("/countries")
+    data, source_used = await try_all_sources("/countries")
     return {
         "success": True,
+        "source_used": source_used,
         "countries": data,
         "count": len(data) if isinstance(data, list) else 0,
     }
@@ -215,25 +263,27 @@ async def list_countries():
 # ==================================================================
 @app.get("/api/numbers", tags=["SMS"])
 async def list_numbers(
-    country: str = Query(..., description="Country name (USA, UK, Canada)"),
-    source: str = Query(None, description="Optional provider filter"),
+    country: str = Query(..., description="Country (USA, UK, Canada)"),
+    source: str = Query(None),
 ):
     params = {}
     if source:
         params["source"] = source
 
-    data = await otp_fetch(f"/list/{country}", params=params)
+    data, source_used = await try_all_sources(f"/list/{country}", params=params)
 
     if isinstance(data, list):
         return {
             "success": True,
             "country": country,
+            "source_used": source_used,
             "count": len(data),
             "numbers": data,
         }
     return {
         "success": True,
         "country": country,
+        "source_used": source_used,
         "data": data,
     }
 
@@ -259,7 +309,7 @@ async def get_otp(
     if source:
         params["source"] = source
 
-    data = await otp_fetch(f"/{country}/{clean_phone}", params=params)
+    data, source_used = await try_all_sources(f"/{country}/{clean_phone}", params=params)
 
     return {
         "success": True,
@@ -267,6 +317,7 @@ async def get_otp(
         "phone_number": clean_phone,
         "match": match,
         "ago": ago,
+        "source_used": source_used,
         "data": data,
     }
 
@@ -284,7 +335,7 @@ async def get_all_sms(
     if not clean_phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    data = await otp_fetch(f"/{country}/{clean_phone}", params={"ago": ago})
+    data, source_used = await try_all_sources(f"/{country}/{clean_phone}", params={"ago": ago})
 
     otp_codes = re.findall(r"\b\d{4,8}\b", str(data))
 
@@ -293,6 +344,7 @@ async def get_all_sms(
         "country": country,
         "phone_number": clean_phone,
         "ago": ago,
+        "source_used": source_used,
         "detected_otp_codes": list(set(otp_codes))[:10],
         "raw": data,
     }
