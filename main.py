@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional
@@ -6,12 +6,11 @@ from bs4 import BeautifulSoup
 import httpx
 import re
 import asyncio
-from datetime import datetime, timezone
 
 app = FastAPI(
     title="Tap SMS API",
     description="Temporary phone numbers + SMS reader — powered by temp-number.com",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -29,7 +28,8 @@ app.add_middleware(
 BASE_URL = "https://temp-number.com"
 NUMBERS_PAGE = f"{BASE_URL}/temporary-numbers"
 
-HEADERS = {
+# Base browser headers (no auth)
+BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 13; M2103K19I Build/TP1A.220624.014) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -50,14 +50,19 @@ HEADERS = {
 }
 
 TIMEOUT = 25.0
-MAX_RETRIES = 2
 
 
 # ==================================================================
-# ============ HTTP FETCH WITH RETRY =============================
+# ============ HTTP FETCH ========================================
 # ==================================================================
-async def fetch(url: str, retries: int = MAX_RETRIES) -> str:
-    """Fetch HTML with retry logic."""
+async def fetch(url: str, cookie: Optional[str] = None, retries: int = 2) -> str:
+    """Fetch HTML with optional cookie and retry."""
+    headers = {**BASE_HEADERS}
+    if cookie:
+        headers["Cookie"] = cookie
+        # When authenticated, referer typically set
+        headers["Referer"] = NUMBERS_PAGE
+
     last_err = None
 
     for attempt in range(retries + 1):
@@ -65,7 +70,7 @@ async def fetch(url: str, retries: int = MAX_RETRIES) -> str:
             async with httpx.AsyncClient(
                 timeout=TIMEOUT,
                 follow_redirects=True,
-                headers=HEADERS,
+                headers=headers,
                 limits=httpx.Limits(max_keepalive_connections=0),
             ) as client:
                 r = await client.get(url)
@@ -88,27 +93,13 @@ async def fetch(url: str, retries: int = MAX_RETRIES) -> str:
 # ============ PARSERS ===========================================
 # ==================================================================
 def parse_numbers(html: str) -> List[dict]:
-    """
-    Parse phone numbers from temp-number.com listing page.
-
-    HTML structure:
-    <article class="number-card" data-href=".../{country}/{phone}">
-      <span class="number-card__country-name">Belgium</span>
-      <img src=".../flags/4x3/be.svg">
-      <span class="pill--new">NEW</span>
-      <time class="number-card__date">40 minutes ago</time>
-      <span class="number-card__number">32468798009</span>
-      <span class="number-card__msgs">3 messages</span>
-    </article>
-    """
+    """Parse phone numbers from listing page."""
     soup = BeautifulSoup(html, "html.parser")
     numbers = []
     seen = set()
 
     for card in soup.find_all("article", class_="number-card"):
         data_href = card.get("data-href", "")
-
-        # Extract phone + country from URL
         m = re.match(
             r"https?://temp-number\.com/temporary-numbers/([^/]+)/(\d+)",
             data_href,
@@ -122,37 +113,29 @@ def parse_numbers(html: str) -> List[dict]:
             continue
         seen.add(phone)
 
-        # Country name
         country_el = card.find("span", class_="number-card__country-name")
         country = country_el.get_text(strip=True) if country_el else country_slug.replace("-", " ").title()
 
-        # Country code from flag image
         cc = ""
         flag_img = card.find("img")
         if flag_img and flag_img.get("src"):
-            flag_match = re.search(r"flags/4x3/([a-z]{2})\.svg", flag_img["src"])
-            if flag_match:
-                cc = flag_match.group(1).upper()
+            fm = re.search(r"flags/4x3/([a-z]{2})\.svg", flag_img["src"])
+            if fm:
+                cc = fm.group(1).upper()
 
-        # Date
         date_el = card.find("time", class_="number-card__date")
         added_at = date_el.get_text(strip=True) if date_el else ""
 
-        # Message count
         msgs_el = card.find("span", class_="number-card__msgs")
         msg_text = msgs_el.get_text(strip=True) if msgs_el else ""
         count_match = re.search(r"(\d+)", msg_text)
         message_count = int(count_match.group(1)) if count_match else 0
 
-        # Is new?
         is_new = bool(card.find("span", class_="pill--new"))
-
-        # Friendly number from country code
-        friendly = f"+{phone}"
 
         numbers.append({
             "phone_number": phone,
-            "friendly_number": friendly,
+            "friendly_number": f"+{phone}",
             "country": country,
             "country_slug": country_slug,
             "country_code": cc,
@@ -160,22 +143,13 @@ def parse_numbers(html: str) -> List[dict]:
             "is_new": is_new,
             "added_at": added_at,
             "detail_url": data_href,
-            "sms_api_url": f"/api/sms/{country_slug}/{phone}",
         })
 
     return numbers
 
 
 def parse_countries(html: str) -> List[dict]:
-    """
-    Parse available countries from listing page.
-
-    HTML structure:
-    <a href="https://temp-number.com/countries/united-states" class="country-card">
-      <span class="country-card__flag"><img src=".../us.svg"></span>
-      <span class="country-card__name">United States</span>
-    </a>
-    """
+    """Parse countries from listing page."""
     soup = BeautifulSoup(html, "html.parser")
     countries = []
     seen = set()
@@ -183,7 +157,6 @@ def parse_countries(html: str) -> List[dict]:
     for card in soup.find_all("a", class_="country-card"):
         if "country-card--more" in card.get("class", []):
             continue
-
         href = card.get("href", "")
         m = re.search(r"/countries/([^/?#]+)", href)
         if not m:
@@ -196,7 +169,6 @@ def parse_countries(html: str) -> List[dict]:
         name_el = card.find("span", class_="country-card__name")
         name = name_el.get_text(strip=True) if name_el else slug.replace("-", " ").title()
 
-        # Country code
         cc = ""
         flag_img = card.find("img")
         if flag_img and flag_img.get("src"):
@@ -214,75 +186,111 @@ def parse_countries(html: str) -> List[dict]:
     return countries
 
 
+def parse_number_metadata(html: str) -> dict:
+    """Extract number metadata from detail page (works without auth)."""
+    soup = BeautifulSoup(html, "html.parser")
+    meta = {}
+
+    # Title
+    title_el = soup.find("title")
+    meta["page_title"] = title_el.get_text(strip=True) if title_el else ""
+
+    # Phone display
+    phone_el = soup.find("span", id="phone-number-display")
+    if phone_el:
+        # Prefer data-full-number if available
+        meta["phone_display"] = phone_el.get("data-full-number") or phone_el.get_text(strip=True)
+
+    # Stats (status, today, total, listed)
+    stats = {}
+    stats_dl = soup.find("dl", class_="ni-stats")
+    if stats_dl:
+        for div in stats_dl.find_all("div"):
+            dt = div.find("dt")
+            dd = div.find("dd")
+            if dt and dd:
+                key = dt.get_text(strip=True).lower().replace(" ", "_")
+                stats[key] = dd.get_text(strip=True)
+    meta["stats"] = stats
+
+    # Number hero info
+    country_el = soup.find("span", class_="ni-num__country")
+    if country_el:
+        meta["country"] = country_el.get_text(strip=True)
+
+    return meta
+
+
 def parse_messages(html: str) -> List[dict]:
     """
-    Parse SMS messages from temp-number.com detail page.
-    Tries multiple known class patterns.
+    Parse SMS messages from detail page (only works when authenticated).
+    Tries multiple class patterns since we don't have authenticated HTML sample.
     """
     soup = BeautifulSoup(html, "html.parser")
     messages = []
 
-    # Try known message card classes
-    possible_classes = [
-        "message-card", "sms-card", "message", "sms-item",
-        "sms-message", "message-item", "inbox-message",
+    # Known message container patterns for temp-number.com
+    patterns = [
+        # Possible classes when authenticated
+        ("div", "ni-msg"),
+        ("div", "sms-msg"),
+        ("div", "message-card"),
+        ("div", "sms-card"),
+        ("div", "message-item"),
+        ("div", "inbox-message"),
+        ("div", "message"),
+        ("article", "ni-msg"),
+        ("article", "sms-msg"),
     ]
 
     containers = []
-    for cls in possible_classes:
-        found = soup.find_all("div", class_=cls)
+    for tag, cls in patterns:
+        found = soup.find_all(tag, class_=cls)
         if found:
             containers = found
             break
 
-    # Fallback: look for any div containing "from" and body
     if not containers:
-        # Look for cards with common heading patterns
-        containers = soup.find_all("div", class_=re.compile(r"(message|sms)", re.I))
+        # Fallback: any div with data-message-id attribute
+        containers = soup.find_all(attrs={"data-message-id": True})
 
     for card in containers:
-        text_content = card.get_text(separator="\n", strip=True)
-        if not text_content or len(text_content) < 5:
+        text = card.get_text(separator="\n", strip=True)
+        if not text or len(text) < 5:
             continue
 
-        # Try to find sender
+        # Extract sender
         sender = "unknown"
-        for pattern in [
-            r"From[:\s]+([+\d\s\-()]+)",
-            r"from[:\s]+([+\d\s\-()]+)",
-        ]:
-            m = re.search(pattern, text_content)
+        from_el = card.find(class_=re.compile(r"(from|sender|origin)", re.I))
+        if from_el:
+            sender = from_el.get_text(strip=True)
+        else:
+            m = re.search(r"From[:\s]+([+\d\s\-()]+)", text)
             if m:
                 sender = m.group(1).strip()
-                break
 
-        # Try to find time
+        # Extract received time
         received = ""
         time_el = card.find("time")
         if time_el:
             received = time_el.get_text(strip=True)
-        else:
-            m_time = re.search(
-                r"(\d+\s+(?:second|minute|hour|day)s?\s+ago|"
-                r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2})",
-                text_content,
-            )
-            if m_time:
-                received = m_time.group(1)
+            if time_el.get("datetime"):
+                received = time_el["datetime"]
 
-        # Extract OTP codes
-        otps = list(set(re.findall(r"\b\d{4,8}\b", text_content)))
+        # Extract OTP codes — from .otp-code elements or regex
+        otps = []
+        for otp_el in card.find_all(class_="otp-code"):
+            code = otp_el.get("data-clipboard-text") or otp_el.get_text(strip=True)
+            code = re.sub(r"\D", "", code)
+            if code:
+                otps.append(code)
 
-        # Clean body: remove header lines
-        body_lines = []
-        for line in text_content.split("\n"):
-            if re.match(r"^(From|Received|Time|Date)[:\s]", line):
-                continue
-            body_lines.append(line)
-        body = "\n".join(body_lines).strip()
+        if not otps:
+            otps = list(set(re.findall(r"\b\d{4,8}\b", text)))
 
-        if not body:
-            continue
+        # Body
+        body_el = card.find(class_=re.compile(r"(body|content|text|message-body)", re.I))
+        body = body_el.get_text(separator="\n", strip=True) if body_el else text
 
         messages.append({
             "from": sender,
@@ -294,32 +302,59 @@ def parse_messages(html: str) -> List[dict]:
     return messages
 
 
-def extract_page_meta(html: str) -> dict:
-    """Extract total count and page info."""
-    meta = {
-        "total_numbers": None,
-        "current_page": None,
-        "total_pages": None,
-    }
+def detect_auth_required(html: str) -> bool:
+    """Check if the page requires login."""
+    soup = BeautifulSoup(html, "html.parser")
+    gate = soup.find("div", class_="ni-gate")
+    if gate:
+        return True
+    if "Sign in to view" in html or "require a free account" in html:
+        return True
+    return False
 
-    # Total numbers: "10,410 numbers available"
+
+def extract_gate_message(html: str) -> dict:
+    """Extract info from the auth gate."""
+    soup = BeautifulSoup(html, "html.parser")
+    gate = soup.find("div", class_="ni-gate")
+    if not gate:
+        return {}
+
+    info = {}
+
+    h3 = gate.find("h3")
+    if h3:
+        info["title"] = h3.get_text(strip=True)
+
+    p = gate.find("p")
+    if p:
+        info["message"] = p.get_text(strip=True)
+
+    number_el = gate.find(class_="ni-gate__number")
+    if number_el:
+        info["number"] = number_el.get_text(strip=True)
+
+    return info
+
+
+def extract_page_meta(html: str) -> dict:
+    """Extract total numbers/page info."""
+    meta = {}
     m = re.search(r"([\d,]+)\s+numbers\s+available", html)
     if m:
         meta["total_numbers"] = int(m.group(1).replace(",", ""))
 
-    # Current page
     m = re.search(r'aria-current=page>(\d+)</a>', html)
     if m:
         meta["current_page"] = int(m.group(1))
 
-    # Last page (from pagination)
-    last_page = 0
+    last = 0
     for m in re.finditer(r'/temporary-numbers/(\d+)"', html):
-        page_num = int(m.group(1))
-        if page_num > last_page:
-            last_page = page_num
-    if last_page:
-        meta["total_pages"] = last_page
+        n = int(m.group(1))
+        if n > last:
+            last = n
+    if last:
+        meta["total_pages"] = last
 
     return meta
 
@@ -332,16 +367,17 @@ async def root():
     return {
         "success": True,
         "service": "Tap SMS API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "source": "temp-number.com",
         "endpoints": {
             "numbers": "/api/numbers?page=1&country=Belgium",
             "countries": "/api/countries",
-            "sms": "/api/sms/{country_slug}/{phone}",
-            "latest_otp": "/api/latest-otp?limit=20",
+            "sms": "/api/sms/{country_slug}/{phone}?cookie=YOUR_SESSION_COOKIE",
+            "raw": "/api/raw?url=...&cookie=...",
             "health": "/api/health",
             "debug": "/api/debug",
         },
+        "note": "SMS messages require authentication. Pass your temp-number.com cookies via ?cookie= parameter.",
     }
 
 
@@ -351,7 +387,7 @@ async def root():
 @app.get("/api/health", tags=["System"])
 async def health():
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=HEADERS) as client:
+        async with httpx.AsyncClient(timeout=10.0, headers=BASE_HEADERS) as client:
             r = await client.get(NUMBERS_PAGE)
             return {
                 "success": True,
@@ -360,19 +396,15 @@ async def health():
                 "source_size": len(r.text),
             }
     except Exception as e:
-        return {
-            "success": False,
-            "status": "unreachable",
-            "error": str(e)[:200],
-        }
+        return {"success": False, "status": "unreachable", "error": str(e)[:200]}
 
 
 # ==================================================================
 # ============ DEBUG ==============================================
 # ==================================================================
 @app.get("/api/debug", tags=["System"])
-async def debug():
-    """Check connectivity and parse sanity."""
+async def debug(cookie: str = Query(None)):
+    """Check connectivity and parser status."""
     try:
         html = await fetch(NUMBERS_PAGE)
         numbers = parse_numbers(html)
@@ -393,20 +425,37 @@ async def debug():
 
 
 # ==================================================================
+# ============ RAW HTML (Debug) ==================================
+# ==================================================================
+@app.get("/api/raw", tags=["System"])
+async def raw_html(
+    url: str = Query(..., description="URL to fetch"),
+    cookie: str = Query(None, description="Optional cookie header"),
+    limit: int = Query(5000, ge=100, le=100000),
+):
+    """Fetch raw HTML for debugging. Pass cookie to test authenticated requests."""
+    html = await fetch(url, cookie=cookie)
+    return {
+        "success": True,
+        "url": url,
+        "has_auth": bool(cookie),
+        "size": len(html),
+        "auth_required": detect_auth_required(html),
+        "preview": html[:limit],
+    }
+
+
+# ==================================================================
 # ============ LIST NUMBERS ======================================
 # ==================================================================
 @app.get("/api/numbers", tags=["SMS"])
 async def list_numbers(
-    page: int = Query(1, ge=1, description="Page number"),
-    country: str = Query(None, description="Filter by country name (e.g. Belgium)"),
-    per_page: int = Query(20, ge=10, le=50, description="Numbers per page"),
-    new_only: bool = Query(False, description="Only show numbers added in last 24h"),
+    page: int = Query(1, ge=1),
+    country: str = Query(None, description="Country name (Belgium, United States)"),
+    per_page: int = Query(20, ge=10, le=50),
+    new_only: bool = Query(False),
 ):
-    """
-    List temporary phone numbers.
-    Supports pagination and country filtering.
-    """
-    # Build URL with page/per_page/country
+    """List temporary phone numbers with filters."""
     url = NUMBERS_PAGE
     params = []
     if page > 1:
@@ -431,10 +480,7 @@ async def list_numbers(
         "count": len(numbers),
         "total": meta.get("total_numbers"),
         "total_pages": meta.get("total_pages"),
-        "filter": {
-            "country": country,
-            "new_only": new_only,
-        },
+        "filter": {"country": country, "new_only": new_only},
         "numbers": numbers,
     }
 
@@ -444,10 +490,9 @@ async def list_numbers(
 # ==================================================================
 @app.get("/api/countries", tags=["SMS"])
 async def list_countries():
-    """List all available countries with temporary numbers."""
+    """List all available countries."""
     html = await fetch(NUMBERS_PAGE)
     countries = parse_countries(html)
-
     return {
         "success": True,
         "count": len(countries),
@@ -462,15 +507,25 @@ async def list_countries():
 async def get_sms(
     country_slug: str,
     phone_number: str,
-    otp_only: bool = Query(False, description="Only return messages with OTP codes"),
+    cookie: str = Query(
+        None,
+        description="Your temp-number.com session cookie (from browser DevTools → Network → Copy as cURL)"
+    ),
+    otp_only: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
 ):
     """
-    Fetch SMS messages for a specific phone number.
+    Fetch SMS messages. Requires authentication cookie for most countries.
 
-    Example: /api/sms/belgium/32468798009
+    **How to get your cookie:**
+    1. Login to temp-number.com in browser
+    2. Open DevTools (F12) → Network tab
+    3. Refresh page and click any request to temp-number.com
+    4. Find `Cookie` header → copy entire value
+    5. Pass as ?cookie=<value> (URL-encoded)
+
+    Example cookie: `XSRF-TOKEN=xxx; tempnumber-session=yyy`
     """
-    # Clean inputs
     phone = re.sub(r"\D", "", phone_number)
     slug = country_slug.strip().lower().replace(" ", "-")
 
@@ -478,14 +533,16 @@ async def get_sms(
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
     detail_url = f"{BASE_URL}/temporary-numbers/{slug}/{phone}"
-    html = await fetch(detail_url)
+    html = await fetch(detail_url, cookie=cookie)
 
-    # Extract number info from the page
-    soup = BeautifulSoup(html, "html.parser")
-    title_el = soup.find("title")
-    title = title_el.get_text(strip=True) if title_el else ""
+    # Metadata (always available)
+    meta = parse_number_metadata(html)
 
-    # Parse messages
+    # Check if auth gate is present
+    auth_required = detect_auth_required(html)
+    gate_info = extract_gate_message(html)
+
+    # Try to parse messages
     messages = parse_messages(html)
 
     if otp_only:
@@ -493,16 +550,36 @@ async def get_sms(
 
     messages = messages[:limit]
 
-    return {
+    # Build response
+    response = {
         "success": True,
         "country_slug": slug,
         "phone_number": phone,
-        "page_title": title,
+        "friendly_number": f"+{phone}",
         "url": detail_url,
+        "authenticated": not auth_required,
+        "auth_required": auth_required,
+        "metadata": meta,
         "otp_only": otp_only,
         "count": len(messages),
         "messages": messages,
     }
+
+    # Add helpful info if auth required
+    if auth_required and not messages:
+        response["info"] = {
+            "gate": gate_info,
+            "hint": "Pass ?cookie=YOUR_SESSION_COOKIE to view messages.",
+            "how_to_get_cookie": [
+                "1. Login at https://temp-number.com/login",
+                "2. Open DevTools (F12) → Network",
+                "3. Refresh page, click any request",
+                "4. Find 'Cookie' header, copy entire value",
+                "5. URL-encode and pass as ?cookie="
+            ],
+        }
+
+    return response
 
 
 # ==================================================================
@@ -510,29 +587,29 @@ async def get_sms(
 # ==================================================================
 @app.get("/api/latest-otp", tags=["SMS"])
 async def latest_otp(
+    cookie: str = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    country: str = Query(None, description="Filter by country name"),
-    scan_numbers: int = Query(5, ge=1, le=20, description="How many numbers to scan"),
+    country: str = Query(None),
+    scan: int = Query(3, ge=1, le=10),
 ):
-    """
-    Get latest OTP codes across multiple numbers.
-    Fetches the first N numbers' detail pages and extracts OTP codes.
-    """
-    # Build list URL
+    """Latest OTPs across multiple numbers. Requires cookie for message access."""
     url = NUMBERS_PAGE
     if country:
         url += f"?country={country}"
 
     list_html = await fetch(url)
     numbers = parse_numbers(list_html)
-    numbers = numbers[:scan_numbers]
+    numbers = numbers[:scan]
 
     all_otps = []
-    errors = 0
+    auth_blocked = 0
 
     for n in numbers:
         try:
-            detail_html = await fetch(n["detail_url"])
+            detail_html = await fetch(n["detail_url"], cookie=cookie)
+            if detect_auth_required(detail_html):
+                auth_blocked += 1
+                continue
             messages = parse_messages(detail_html)
             for m in messages:
                 if m["otp_codes"]:
@@ -540,43 +617,29 @@ async def latest_otp(
                         "phone_number": n["phone_number"],
                         "friendly_number": n["friendly_number"],
                         "country": n["country"],
-                        "country_code": n["country_code"],
                         "from": m["from"],
                         "body": m["body"][:300],
                         "otp_codes": m["otp_codes"],
                         "received_at": m["received_at"],
                     })
         except Exception:
-            errors += 1
+            continue
 
     all_otps = all_otps[:limit]
 
-    return {
+    response = {
         "success": True,
-        "scanned_numbers": len(numbers),
-        "errors": errors,
+        "scanned": len(numbers),
+        "auth_blocked": auth_blocked,
         "count": len(all_otps),
         "country_filter": country,
         "otps": all_otps,
     }
 
+    if auth_blocked and not all_otps:
+        response["hint"] = "Most numbers require auth. Pass ?cookie=YOUR_SESSION_COOKIE"
 
-# ==================================================================
-# ============ RAW HTML (Debug helper) ===========================
-# ==================================================================
-@app.get("/api/raw", tags=["System"])
-async def raw_html(
-    url: str = Query(..., description="URL to fetch"),
-    limit: int = Query(5000, ge=100, le=50000),
-):
-    """Fetch raw HTML for debugging parsers."""
-    html = await fetch(url)
-    return {
-        "success": True,
-        "url": url,
-        "size": len(html),
-        "preview": html[:limit],
-    }
+    return response
 
 
 # ============ ERROR HANDLERS ============
@@ -584,11 +647,7 @@ async def raw_html(
 async def http_exception_handler(request, exc):
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "success": False,
-            "error": exc.detail,
-            "status_code": exc.status_code,
-        },
+        content={"success": False, "error": exc.detail, "status_code": exc.status_code},
     )
 
 
