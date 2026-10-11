@@ -4,12 +4,13 @@ from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional
 import httpx
 import re
+import asyncio
 from datetime import datetime, timezone
 
 app = FastAPI(
     title="Tap SMS API",
-    description="Free temporary phone numbers + SMS reader — via OTP API aggregator",
-    version="4.0.0",
+    description="Free temporary phone numbers + SMS reader",
+    version="5.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -23,9 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ OTP API AGGREGATOR ============
-# Docs: https://otp-api.shelex.dev/docs/static/index.html
-OTP_API_BASE = "https://otp-api.shelex.dev/api"
+# ============ SOURCES ============
+OTP_API = "https://otp-api.shelex.dev/api"
 
 HEADERS = {
     "User-Agent": (
@@ -35,32 +35,73 @@ HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "close",
 }
 
-TIMEOUT = 25.0
+TIMEOUT = 20.0
+MAX_RETRIES = 3
 
 
 # ==================================================================
-# ============ HTTP CLIENT =======================================
+# ============ ROBUST HTTP WITH RETRY ============================
 # ==================================================================
-async def otp_request(path: str, params: dict = None):
-    """Call otp-api.shelex.dev."""
-    async with httpx.AsyncClient(
-        timeout=TIMEOUT, follow_redirects=True, headers=HEADERS
-    ) as client:
-        url = f"{OTP_API_BASE}{path}"
+async def robust_get(url: str, params: dict = None, retries: int = MAX_RETRIES) -> Optional[httpx.Response]:
+    """
+    GET with retry and exponential backoff.
+    Handles DNS/network errors gracefully.
+    """
+    last_error = None
+
+    for attempt in range(retries):
         try:
-            resp = await client.get(url, params=params)
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Upstream error: {resp.text[:200]}",
-                )
-            return resp.json()
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Upstream timed out")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+            # Fresh client each time (avoids connection pool issues)
+            async with httpx.AsyncClient(
+                timeout=TIMEOUT,
+                follow_redirects=True,
+                headers=HEADERS,
+                limits=httpx.Limits(max_keepalive_connections=0, max_connections=5),
+            ) as client:
+                resp = await client.get(url, params=params)
+                return resp
+        except (httpx.ConnectError, httpx.NetworkError, OSError) as e:
+            last_error = str(e)[:150]
+            if attempt < retries - 1:
+                await asyncio.sleep(1 * (attempt + 1))  # 1s, 2s backoff
+            continue
+        except httpx.TimeoutException as e:
+            last_error = f"Timeout: {str(e)[:100]}"
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+            continue
+        except Exception as e:
+            last_error = str(e)[:150]
+            break
+
+    return None
+
+
+async def otp_fetch(path: str, params: dict = None) -> dict:
+    """Fetch from OTP API with retry."""
+    url = f"{OTP_API}{path}"
+    resp = await robust_get(url, params=params)
+
+    if resp is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach OTP aggregator (network/DNS issue)",
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Aggregator error {resp.status_code}: {resp.text[:200]}",
+        )
+
+    try:
+        return resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Invalid JSON from aggregator")
 
 
 # ==================================================================
@@ -71,34 +112,97 @@ async def root():
     return {
         "success": True,
         "service": "Tap SMS API",
-        "version": "4.0.0",
-        "backend": "otp-api.shelex.dev (multi-provider aggregator)",
-        "providers": [
-            "receive-sms-free.cc",
-            "anonymsms.com",
-            "quackr.io",
-            "smstome.com",
-            "receivesms.co",
-            "receiveasmsonline.com",
-            "receive-smss-online.com",
-        ],
+        "version": "5.0.0",
+        "backend": "otp-api.shelex.dev",
         "endpoints": {
             "countries": "/api/countries",
             "numbers": "/api/numbers?country=USA",
-            "otp": "/api/otp/{country}/{phone}?match=code&ago=10m",
-            "sms_all": "/api/sms/{country}/{phone}",
+            "otp": "/api/otp/{country}/{phone}",
+            "sms": "/api/sms/{country}/{phone}",
             "health": "/api/health",
+            "test": "/api/test",
         },
     }
 
 
 # ==================================================================
-# ============ LIST COUNTRIES ====================================
+# ============ TEST ENDPOINT (no external call) ==================
+# ==================================================================
+@app.get("/api/test", tags=["System"])
+async def test():
+    """
+    Test the basic HTTP connectivity without hitting OTP API.
+    Uses a reliable endpoint to verify DNS/network works.
+    """
+    results = {}
+
+    # Test 1: Google DNS
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get("https://www.google.com/generate_204")
+            results["google"] = {"status": r.status_code, "ok": r.status_code in (200, 204)}
+    except Exception as e:
+        results["google"] = {"error": str(e)[:100]}
+
+    # Test 2: Cloudflare
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get("https://1.1.1.1/cdn-cgi/trace")
+            results["cloudflare"] = {"status": r.status_code, "ok": r.status_code == 200}
+    except Exception as e:
+        results["cloudflare"] = {"error": str(e)[:100]}
+
+    # Test 3: OTP API countries
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
+            r = await client.get(f"{OTP_API}/countries")
+            results["otp_api"] = {
+                "status": r.status_code,
+                "size": len(r.text),
+                "ok": r.status_code == 200,
+            }
+    except Exception as e:
+        results["otp_api"] = {"error": str(e)[:150]}
+
+    all_ok = all(r.get("ok", False) for r in results.values())
+
+    return {
+        "success": True,
+        "all_working": all_ok,
+        "results": results,
+    }
+
+
+# ==================================================================
+# ============ HEALTH =============================================
+# ==================================================================
+@app.get("/api/health", tags=["System"])
+async def health():
+    """Quick health check."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
+            r = await client.get(f"{OTP_API}/countries")
+            return {
+                "success": True,
+                "status": "healthy" if r.status_code == 200 else "degraded",
+                "aggregator_status": r.status_code,
+                "aggregator_size": len(r.text),
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "status": "unreachable",
+            "error": str(e)[:200],
+            "hint": "Try /api/test to diagnose DNS/network",
+        }
+
+
+# ==================================================================
+# ============ COUNTRIES =========================================
 # ==================================================================
 @app.get("/api/countries", tags=["SMS"])
 async def list_countries():
-    """List all available countries from aggregator."""
-    data = await otp_request("/countries")
+    data = await otp_fetch("/countries")
     return {
         "success": True,
         "countries": data,
@@ -107,22 +211,18 @@ async def list_countries():
 
 
 # ==================================================================
-# ============ LIST NUMBERS ======================================
+# ============ NUMBERS ===========================================
 # ==================================================================
 @app.get("/api/numbers", tags=["SMS"])
 async def list_numbers(
-    country: str = Query(..., description="Country name (e.g. USA, UK, Canada)"),
+    country: str = Query(..., description="Country name (USA, UK, Canada)"),
     source: str = Query(None, description="Optional provider filter"),
 ):
-    """
-    List all phone numbers for a country.
-    Example: /api/numbers?country=USA
-    """
     params = {}
     if source:
         params["source"] = source
 
-    data = await otp_request(f"/list/{country}", params=params)
+    data = await otp_fetch(f"/list/{country}", params=params)
 
     if isinstance(data, list):
         return {
@@ -131,41 +231,24 @@ async def list_numbers(
             "count": len(data),
             "numbers": data,
         }
-    elif isinstance(data, dict):
-        return {
-            "success": True,
-            "country": country,
-            "data": data,
-        }
-    else:
-        return {
-            "success": False,
-            "country": country,
-            "message": "Unexpected response format",
-            "raw": str(data)[:500],
-        }
+    return {
+        "success": True,
+        "country": country,
+        "data": data,
+    }
 
 
 # ==================================================================
-# ============ GET OTP / SMS =====================================
+# ============ OTP ===============================================
 # ==================================================================
 @app.get("/api/otp/{country}/{phone}", tags=["SMS"])
 async def get_otp(
     country: str,
     phone: str,
-    match: str = Query(None, description="Substring to look for in SMS"),
-    ago: str = Query("30s", description="Time window: 10s, 5m, 1h, 2d"),
-    source: str = Query(None, description="Provider: receive-sms-free.cc, smstome.com, ..."),
+    match: str = Query(None),
+    ago: str = Query("30s"),
+    source: str = Query(None),
 ):
-    """
-    Fetch latest OTP/SMS for a specific number.
-
-    Examples:
-    - /api/otp/USA/1234567890
-    - /api/otp/UK/447455958594?match=amazon&ago=5m
-    - /api/otp/USA/1234567890?source=smstome.com
-    """
-    # Clean phone
     clean_phone = re.sub(r"\D", "", phone)
     if not clean_phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
@@ -176,7 +259,7 @@ async def get_otp(
     if source:
         params["source"] = source
 
-    data = await otp_request(f"/{country}/{clean_phone}", params=params)
+    data = await otp_fetch(f"/{country}/{clean_phone}", params=params)
 
     return {
         "success": True,
@@ -184,33 +267,26 @@ async def get_otp(
         "phone_number": clean_phone,
         "match": match,
         "ago": ago,
-        "source": source,
         "data": data,
     }
 
 
 # ==================================================================
-# ============ GET ALL SMS (no filter) ===========================
+# ============ ALL SMS ===========================================
 # ==================================================================
 @app.get("/api/sms/{country}/{phone}", tags=["SMS"])
 async def get_all_sms(
     country: str,
     phone: str,
-    ago: str = Query("1h", description="Time window: 10s, 5m, 1h, 2d"),
+    ago: str = Query("1h"),
 ):
-    """
-    Get all recent SMS for a number (no match filter).
-    """
     clean_phone = re.sub(r"\D", "", phone)
     if not clean_phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    data = await otp_request(f"/{country}/{clean_phone}", params={"ago": ago})
+    data = await otp_fetch(f"/{country}/{clean_phone}", params={"ago": ago})
 
-    # Try to extract OTP codes from response
-    otp_codes = []
-    body_text = str(data)
-    otp_codes = re.findall(r"\b\d{4,8}\b", body_text)
+    otp_codes = re.findall(r"\b\d{4,8}\b", str(data))
 
     return {
         "success": True,
@@ -220,29 +296,6 @@ async def get_all_sms(
         "detected_otp_codes": list(set(otp_codes))[:10],
         "raw": data,
     }
-
-
-# ==================================================================
-# ============ HEALTH =============================================
-# ==================================================================
-@app.get("/api/health", tags=["System"])
-async def health():
-    """Check if aggregator API is reachable."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0, headers=HEADERS) as client:
-            r = await client.get(f"{OTP_API_BASE}/countries")
-            return {
-                "success": True,
-                "status": "healthy",
-                "aggregator_reachable": r.status_code == 200,
-                "aggregator_status": r.status_code,
-            }
-    except Exception as e:
-        return {
-            "success": False,
-            "status": "unreachable",
-            "error": str(e)[:200],
-        }
 
 
 # ============ ERROR HANDLERS ============
