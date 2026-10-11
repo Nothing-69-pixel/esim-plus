@@ -4,13 +4,13 @@ from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional
 import httpx
 import re
-import json
+import time
 from datetime import datetime, timezone
 
 app = FastAPI(
     title="Tap SMS API",
     description="Temporary phone numbers + SMS reader — powered by esimplus.me",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -28,39 +28,76 @@ app.add_middleware(
 BASE_URL = "https://esimplus.me"
 NUMBERS_PAGE = f"{BASE_URL}/temporary-numbers"
 
+# Full browser-like headers
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; M2103K19I Build/TP1A.220624.014) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.36 Mobile Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-User": "?1",
     "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "DNT": "1",
+    "Cookie": "cookie-consent=analytics_cookies%3D1%26other_cookies%3D1; NEXT_LOCALE=en",
 }
 
-TIMEOUT = 25.0
+# Minimal headers for internal API
+API_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": BASE_URL,
+    "Referer": NUMBERS_PAGE,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Ch-Ua": HEADERS["Sec-Ch-Ua"],
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Cookie": HEADERS["Cookie"],
+}
+
+TIMEOUT = 30.0
 
 
 # ==================================================================
 # ============ HTTP HELPERS ======================================
 # ==================================================================
 async def fetch_html(url: str) -> str:
-    """Fetch HTML page from esimplus.me."""
+    """Fetch HTML page with full browser headers."""
     async with httpx.AsyncClient(
-        timeout=TIMEOUT, follow_redirects=True, headers=HEADERS
+        timeout=TIMEOUT,
+        follow_redirects=True,
+        headers=HEADERS,
+        http2=False,
     ) as client:
         try:
             resp = await client.get(url)
+            if resp.status_code == 403:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access forbidden by upstream (esimplus.me blocked the request)",
+                )
             if resp.status_code != 200:
                 raise HTTPException(
                     status_code=resp.status_code,
-                    detail=f"Upstream error {resp.status_code}",
+                    detail=f"Upstream error {resp.status_code}: {resp.text[:200]}",
                 )
             return resp.text
         except httpx.TimeoutException:
@@ -69,15 +106,57 @@ async def fetch_html(url: str) -> str:
             raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
 
 
+async def fetch_json(url: str) -> Optional[dict]:
+    """Try to fetch JSON from internal API."""
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT,
+        follow_redirects=True,
+        headers=API_HEADERS,
+        http2=False,
+    ) as client:
+        try:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
+
+async def try_internal_api() -> Optional[List[dict]]:
+    """
+    Try common Next.js internal API endpoints.
+    Return list of numbers if any works.
+    """
+    candidates = [
+        f"{BASE_URL}/api/temporary-numbers",
+        f"{BASE_URL}/api/v1/temporary-numbers",
+        f"{BASE_URL}/api/phone-numbers",
+        f"{BASE_URL}/api/v1/phone-numbers",
+        f"{BASE_URL}/api/numbers",
+    ]
+
+    for url in candidates:
+        data = await fetch_json(url)
+        if data and isinstance(data, (list, dict)):
+            # Try to extract numbers from response
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                # Look for common keys
+                for key in ["data", "numbers", "items", "results"]:
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
+        time.sleep(0.2)
+
+    return None
+
+
 # ==================================================================
 # ============ PARSING HELPERS ===================================
 # ==================================================================
 def extract_numbers_from_html(html: str) -> List[dict]:
-    """
-    Extract phone number objects from __next_f streamed JSON.
-    Pattern: {"provider":"...","phoneNumber":"...","countryCode":"...","slug":"...","createdAt":"...","friendlyPhoneNumber":"..."}
-    """
-    # Find all number-like JSON objects
+    """Extract phone numbers from Next.js streamed data."""
     pattern = re.compile(
         r'\{"provider":"([^"]+)","phoneNumber":"(\d+)","countryCode":"([^"]+)",'
         r'"slug":"([^"]+)","description":(?:null|"[^"]*"),'
@@ -89,10 +168,9 @@ def extract_numbers_from_html(html: str) -> List[dict]:
 
     for m in pattern.finditer(html):
         provider, phone, cc, slug, created, friendly = m.groups()
-        key = phone
-        if key in seen:
+        if phone in seen:
             continue
-        seen.add(key)
+        seen.add(phone)
 
         numbers.append({
             "phone_number": phone,
@@ -109,10 +187,7 @@ def extract_numbers_from_html(html: str) -> List[dict]:
 
 
 def extract_sms_from_html(html: str) -> List[dict]:
-    """
-    Extract SMS messages from __next_f streamed JSON.
-    Pattern: {"provider":"...","from":"...","to":"...","body":"...","receivedAt":"...","friendlyFrom":"...","friendlyTo":"..."}
-    """
+    """Extract SMS messages from Next.js streamed data."""
     pattern = re.compile(
         r'\{"provider":"([^"]+)","from":"([^"]*)","to":"([^"]*)",'
         r'"body":"((?:[^"\\]|\\.)*)","receivedAt":"([^"]+)",'
@@ -130,14 +205,12 @@ def extract_sms_from_html(html: str) -> List[dict]:
             continue
         seen.add(key)
 
-        # Unescape body
         try:
             body_clean = body.encode().decode("unicode_escape")
         except Exception:
             body_clean = body
         body_clean = body_clean.replace("\\n", "\n").replace('\\"', '"')
 
-        # Extract OTP-like codes
         otp_codes = re.findall(r"\b\d{4,8}\b", body_clean)
 
         messages.append({
@@ -151,25 +224,13 @@ def extract_sms_from_html(html: str) -> List[dict]:
             "otp_codes": otp_codes,
         })
 
-    # Sort newest first
     messages.sort(key=lambda x: x.get("received_at", ""), reverse=True)
     return messages
 
 
 def extract_total_count(html: str) -> Optional[int]:
-    """Extract total SMS count from pagination."""
     m = re.search(r'"pagination":\{"total":(\d+)', html)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def extract_number_from_detail_page(html: str) -> Optional[dict]:
-    """Extract the focused number object from a detail page."""
-    numbers = extract_numbers_from_html(html)
-    if numbers:
-        return numbers[0]
-    return None
+    return int(m.group(1)) if m else None
 
 
 # ==================================================================
@@ -180,7 +241,7 @@ async def root():
     return {
         "success": True,
         "service": "Tap SMS API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "backend": "esimplus.me",
         "endpoints": {
             "numbers": "/api/numbers",
@@ -189,8 +250,64 @@ async def root():
             "number_detail": "/api/number/{phone_number}",
             "sms": "/api/sms/{phone_number}",
             "sms_otp_only": "/api/sms/{phone_number}?otp_only=true",
+            "latest_otp": "/api/latest-otp",
+            "debug": "/api/debug",
             "health": "/api/health",
         },
+    }
+
+
+# ==================================================================
+# ============ DEBUG ==============================================
+# ==================================================================
+@app.get("/api/debug", tags=["System"])
+async def debug():
+    """
+    Test connectivity to esimplus.me with different approaches.
+    """
+    results = {}
+
+    # Test 1: Direct HTML fetch
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0, follow_redirects=True, headers=HEADERS
+        ) as client:
+            r = await client.get(NUMBERS_PAGE)
+            results["html_fetch"] = {
+                "status": r.status_code,
+                "size": len(r.text),
+                "has_next_data": "__next_f" in r.text,
+                "is_cloudflare": "cloudflare" in r.text.lower()[:2000],
+            }
+    except Exception as e:
+        results["html_fetch"] = {"error": str(e)}
+
+    # Test 2: Internal API endpoints
+    api_tests = {}
+    candidates = [
+        f"{BASE_URL}/api/temporary-numbers",
+        f"{BASE_URL}/api/v1/temporary-numbers",
+        f"{BASE_URL}/api/phone-numbers",
+        f"{BASE_URL}/api/numbers",
+    ]
+    async with httpx.AsyncClient(
+        timeout=10.0, follow_redirects=True, headers=API_HEADERS
+    ) as client:
+        for url in candidates:
+            try:
+                r = await client.get(url)
+                api_tests[url] = {
+                    "status": r.status_code,
+                    "preview": r.text[:200],
+                }
+            except Exception as e:
+                api_tests[url] = {"error": str(e)}
+
+    results["api_tests"] = api_tests
+
+    return {
+        "success": True,
+        "results": results,
     }
 
 
@@ -202,10 +319,6 @@ async def list_numbers(
     country: str = Query(None, description="Filter by country code (US, CA, PR)"),
     limit: int = Query(200, ge=1, le=500),
 ):
-    """
-    List all temporary phone numbers from esimplus.me.
-    Optionally filter by country code.
-    """
     html = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
 
@@ -215,7 +328,6 @@ async def list_numbers(
 
     numbers = numbers[:limit]
 
-    # Group by country for summary
     by_country: Dict[str, int] = {}
     for n in numbers:
         cc = n["country_code"]
@@ -234,7 +346,6 @@ async def list_numbers(
 # ==================================================================
 @app.get("/api/countries", tags=["SMS"])
 async def list_countries():
-    """List available country codes with number counts."""
     html = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
 
@@ -264,16 +375,10 @@ async def list_countries():
 # ==================================================================
 @app.get("/api/number/{phone_number}", tags=["SMS"])
 async def number_detail(phone_number: str):
-    """
-    Get details for a specific phone number.
-    Example: /api/number/19393150836
-    """
-    # Clean input
     phone = re.sub(r"\D", "", phone_number)
     if not phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    # First find the slug from the list page
     html = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
     target = next((n for n in numbers if n["phone_number"] == phone), None)
@@ -285,10 +390,7 @@ async def number_detail(phone_number: str):
             "phone_number": phone,
         }
 
-    # Fetch the detail page
-    detail_url = target["detail_url"]
-    detail_html = await fetch_html(detail_url)
-
+    detail_html = await fetch_html(target["detail_url"])
     sms = extract_sms_from_html(detail_html)
     total = extract_total_count(detail_html) or len(sms)
 
@@ -307,13 +409,9 @@ async def number_detail(phone_number: str):
 @app.get("/api/sms/{phone_number}", tags=["SMS"])
 async def get_sms(
     phone_number: str,
-    otp_only: bool = Query(False, description="Only return messages with OTP codes"),
+    otp_only: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """
-    Get SMS messages for a phone number.
-    Optionally filter to only OTP messages.
-    """
     phone = re.sub(r"\D", "", phone_number)
     if not phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
@@ -351,16 +449,13 @@ async def get_sms(
 
 
 # ==================================================================
-# ============ LATEST OTP (all numbers) ==========================
+# ============ LATEST OTP ========================================
 # ==================================================================
 @app.get("/api/latest-otp", tags=["SMS"])
 async def latest_otp(
-    country: str = Query(None, description="Filter by country code"),
+    country: str = Query(None),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """
-    Get latest OTP messages across all numbers (or a specific country).
-    """
     html = await fetch_html(NUMBERS_PAGE)
     numbers = extract_numbers_from_html(html)
 
@@ -368,8 +463,7 @@ async def latest_otp(
         cc = country.upper()
         numbers = [n for n in numbers if n["country_code"] == cc]
 
-    # Only fetch from the first 5 numbers to avoid too many requests
-    numbers = numbers[:5]
+    numbers = numbers[:5]  # Only first 5 to avoid timeouts
 
     all_otps = []
     for n in numbers:
@@ -410,6 +504,7 @@ async def health():
         "success": True,
         "status": "healthy",
         "backend": "esimplus.me",
+        "version": "2.0.0",
     }
 
 
@@ -430,7 +525,6 @@ async def general_exception_handler(request, exc):
     )
 
 
-# ============ LOCAL DEV ============
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
