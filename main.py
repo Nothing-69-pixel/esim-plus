@@ -5,14 +5,13 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 import httpx
 import asyncio
-import re
 import time
 from datetime import datetime, timezone
 
 app = FastAPI(
     title="AI Image Generator API",
-    description="Generate AI images — just give a prompt, model is auto-detected",
-    version="4.0.0",
+    description="Generate AI images — just give a prompt, get the image URL",
+    version="5.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -30,7 +29,6 @@ app.add_middleware(
 BASE_URL = "https://ai-tool-service.template.net"
 GENERATE_URL = f"{BASE_URL}/api/v3/image-generate-by-model"
 STATUS_URL = f"{BASE_URL}/api/v3/image-generation/status"
-TEMPLATE_PAGE = "https://www.template.net/ai-image-generator"
 
 HEADERS = {
     "User-Agent": (
@@ -50,19 +48,8 @@ HEADERS = {
 }
 
 TIMEOUT = 30.0
-POLL_TIMEOUT = 8.0       # Vercel-safe
-POLL_INTERVAL = 1.2
 
-# The model the website currently uses by default
-# (auto-fetched, refreshed periodically)
-MODEL_CACHE: Dict = {"current": None, "fetched_at": 0}
-CACHE_TTL = 1800  # 30 min
-
-# Jobs store
-JOBS: Dict[str, dict] = {}
-
-# ⭐ These are the working model IDs that the template.net API accepts.
-# The website changes these — we try them in order.
+# Working models — auto try until one succeeds
 WORKING_MODELS = [
     "gpt-image-2.5-flare",
     "gpt-image-1",
@@ -71,64 +58,8 @@ WORKING_MODELS = [
     "dall-e-3",
 ]
 
-
-# ==================================================================
-# ============ AUTO MODEL DETECTION ==============================
-# ==================================================================
-async def detect_current_model() -> str:
-    """
-    Return the model that template.net currently accepts.
-    Cached for CACHE_TTL seconds.
-    """
-    now = time.time()
-    if MODEL_CACHE["current"] and (now - MODEL_CACHE["fetched_at"] < CACHE_TTL):
-        return MODEL_CACHE["current"]
-
-    # Try the first known working model
-    # (These rarely change; if they do, we'll know from errors)
-    model = WORKING_MODELS[0]
-    MODEL_CACHE["current"] = model
-    MODEL_CACHE["fetched_at"] = now
-    return model
-
-
-async def try_generate_with_fallback(payload_base: dict) -> dict:
-    """
-    Try generation with each working model until one succeeds.
-    Returns the successful response with `_model_used`.
-    """
-    last_error = None
-
-    for model in WORKING_MODELS:
-        payload = {**payload_base, "model": model}
-        init = await post_generate(payload)
-
-        status = init.get("status")
-        data = init.get("data", {})
-
-        # Success criteria
-        if status in (200, 201) and (data.get("activityId") or data.get("id") or data.get("data", {}).get("activityId")):
-            return {
-                "success": True,
-                "model_used": model,
-                "status": status,
-                "data": data,
-            }
-
-        # Model-specific error? Try next
-        error_msg = str(data)[:200]
-        last_error = {"model": model, "status": status, "error": error_msg}
-
-        # If it's a "model not found" type error, try next
-        # If it's some other issue (network), break
-        if status not in (200, 201, 400, 404, 422):
-            break
-
-    return {
-        "success": False,
-        "error": "All models failed",
-        "last_error": last_error,
-    }
+# Jobs cache
+JOBS: Dict[str, dict] = {}
 
 
 # ==================================================================
@@ -155,30 +86,7 @@ async def get_status(activity_id: str) -> dict:
         return {"status": r.status_code, "data": data}
 
 
-async def wait_for_completion(activity_id: str, max_wait: float = POLL_TIMEOUT) -> dict:
-    start = time.time()
-    last = None
-    while True:
-        try:
-            res = await get_status(activity_id)
-            data = res.get("data", {})
-            last = data
-            status = data.get("status", "")
-            if status in ("completed", "failed", "error"):
-                return data
-        except Exception:
-            pass
-        elapsed = time.time() - start
-        if elapsed >= max_wait:
-            if last:
-                last["_timeout"] = True
-                last["_elapsed"] = round(elapsed, 1)
-            return last or {"status": "timeout", "activityId": activity_id}
-        await asyncio.sleep(POLL_INTERVAL)
-
-
 def build_payload(prompt: str, quality: str = "low", aspect_ratio: str = "16:9") -> dict:
-    """Standard payload for template.net."""
     return {
         "toolPrompt": "",
         "userPrompt": prompt,
@@ -193,6 +101,82 @@ def build_payload(prompt: str, quality: str = "low", aspect_ratio: str = "16:9")
     }
 
 
+async def try_generate(payload_base: dict) -> dict:
+    """Try each model until one succeeds."""
+    last_error = None
+    for model in WORKING_MODELS:
+        payload = {**payload_base, "model": model}
+        init = await post_generate(payload)
+        status = init.get("status")
+        data = init.get("data", {})
+
+        activity_id = (
+            data.get("activityId")
+            or data.get("data", {}).get("activityId")
+            or data.get("id")
+        )
+
+        if status in (200, 201) and activity_id:
+            return {"success": True, "model_used": model, "activity_id": activity_id, "data": data}
+
+        last_error = {"model": model, "status": status, "error": str(data)[:200]}
+
+    return {"success": False, "last_error": last_error}
+
+
+async def poll_until_complete(activity_id: str, max_seconds: int = 90) -> dict:
+    """
+    Poll until image is ready or max_seconds exceeded.
+    Uses fast polling (1s intervals) for quick response.
+    """
+    start = time.time()
+    last_data = None
+    attempt = 0
+
+    while time.time() - start < max_seconds:
+        attempt += 1
+        try:
+            res = await get_status(activity_id)
+            data = res.get("data", {})
+            last_data = data
+
+            status = data.get("status")
+            inner = data.get("data", {})
+            urls = inner.get("urls", []) or data.get("urls", [])
+
+            if status == "completed" and urls:
+                return {
+                    "success": True,
+                    "status": "completed",
+                    "image_url": urls[0],
+                    "all_urls": urls,
+                    "thumbnail": inner.get("thumbnail") or data.get("thumbnail"),
+                    "resolved_prompt": inner.get("resolvedPrompt") or data.get("resolvedPrompt"),
+                    "created_at": inner.get("createdAt") or data.get("createdAt"),
+                    "attempts": attempt,
+                    "time_taken": round(time.time() - start, 1),
+                }
+
+            if status in ("failed", "error"):
+                return {
+                    "success": False,
+                    "status": status,
+                    "message": data.get("message", "Generation failed"),
+                    "attempts": attempt,
+                }
+        except Exception:
+            pass
+
+        await asyncio.sleep(1.0)
+
+    return {
+        "success": False,
+        "status": "timeout",
+        "message": f"Image not ready after {max_seconds}s",
+        "attempts": attempt,
+    }
+
+
 # ==================================================================
 # ============ ROOT ==============================================
 # ==================================================================
@@ -201,20 +185,14 @@ async def root():
     return {
         "success": True,
         "service": "AI Image Generator API",
-        "version": "4.0.0",
-        "usage": "Just give a prompt — model is auto-detected. No model parameter needed.",
+        "version": "5.0.0",
+        "usage": "Give a prompt — get the image URL. No processing messages.",
         "endpoints": {
-            "generate_simple": "/api/generate?prompt=A%20cute%20cat",
-            "generate_smart": "/api/auto?prompt=A%20cute%20cat",
-            "status": "/api/status/{activity_id}",
-            "image": "/api/image/{activity_id}",
+            "generate": "/api/generate?prompt=A%20cute%20cat",
+            "image": "/api/image?prompt=A%20cute%20cat",
             "jobs": "/api/jobs",
             "health": "/api/health",
         },
-        "example": [
-            "https://your-app.vercel.app/api/generate?prompt=A cute cat",
-            "https://your-app.vercel.app/api/auto?prompt=A dragon over mountains",
-        ],
     }
 
 
@@ -223,265 +201,138 @@ async def root():
 # ==================================================================
 @app.get("/api/health", tags=["System"])
 async def health():
-    return {
-        "success": True,
-        "status": "healthy",
-        "cached_model": MODEL_CACHE.get("current"),
-        "jobs_cached": len(JOBS),
-    }
+    return {"success": True, "status": "healthy", "jobs": len(JOBS)}
 
 
 # ==================================================================
-# ============ GENERATE — Prompt Only ⭐ ==========================
+# ============ GENERATE — FULL WAIT ⭐ ============================
 # ==================================================================
 @app.get("/api/generate", tags=["Generate"])
-async def generate_simple(
-    prompt: str = Query(..., description="What you want to generate — model auto-detected"),
+async def generate(
+    prompt: str = Query(..., description="What to generate"),
     quality: str = Query("low"),
     aspect_ratio: str = Query("16:9", alias="aspectRatio"),
+    max_wait: int = Query(90, ge=10, le=120, description="Max seconds to wait"),
 ):
     """
-    Generate image from a prompt. Model is auto-detected from template.net.
-    No model parameter needed.
+    Generate image — waits until complete, then returns image URL.
+    No processing response — only final image or error.
     """
+    # 1) Initiate
     payload_base = build_payload(prompt, quality, aspect_ratio)
-
-    # ⭐ Try each working model until one succeeds
-    result = await try_generate_with_fallback(payload_base)
+    result = await try_generate(payload_base)
 
     if not result["success"]:
-        return {
-            "success": False,
-            "error": result["error"],
-            "last_error": result.get("last_error"),
-            "prompt": prompt,
-        }
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to initiate. Last error: {result.get('last_error')}",
+        )
 
-    init_data = result["data"]
+    activity_id = result["activity_id"]
     model_used = result["model_used"]
-
-    activity_id = (
-        init_data.get("activityId")
-        or init_data.get("data", {}).get("activityId")
-        or init_data.get("id")
-    )
-
-    if not activity_id:
-        return {
-            "success": False,
-            "error": "No activityId",
-            "response": init_data,
-        }
 
     JOBS[activity_id] = {
         "activity_id": activity_id,
         "prompt": prompt,
         "model": model_used,
-        "quality": quality,
-        "aspect_ratio": aspect_ratio,
         "initiated_at": datetime.now(timezone.utc).isoformat(),
         "status": "processing",
     }
 
-    # Wait for completion
-    final = await wait_for_completion(activity_id)
-    inner = final.get("data", {})
-    urls = inner.get("urls", []) or final.get("urls", [])
-    status = final.get("status", "unknown")
+    # 2) Wait until complete (up to max_wait seconds)
+    final = await poll_until_complete(activity_id, max_seconds=max_wait)
 
-    JOBS[activity_id].update({
-        "status": status,
-        "urls": urls,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-    # Completed ✅
-    if status == "completed" and urls:
+    if final["success"]:
+        JOBS[activity_id].update({
+            "status": "completed",
+            "image_url": final["image_url"],
+        })
         return {
             "success": True,
-            "status": "completed",
             "prompt": prompt,
             "model_used": model_used,
-            "image_url": urls[0],
-            "all_urls": urls,
-            "thumbnail": inner.get("thumbnail") or final.get("thumbnail"),
+            "image_url": final["image_url"],
+            "all_urls": final["all_urls"],
+            "thumbnail": final.get("thumbnail"),
+            "resolved_prompt": final.get("resolved_prompt"),
+            "created_at": final.get("created_at"),
             "activity_id": activity_id,
-            "resolved_prompt": inner.get("resolvedPrompt") or final.get("resolvedPrompt"),
-            "created_at": inner.get("createdAt") or final.get("createdAt"),
+            "time_taken_seconds": final.get("time_taken"),
         }
 
-    # Timeout — still processing
-    if final.get("_timeout"):
-        return {
-            "success": False,
-            "status": "processing",
-            "prompt": prompt,
-            "model_used": model_used,
+    # Failed or timeout
+    JOBS[activity_id].update({"status": final["status"]})
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "message": final.get("message", "Generation failed"),
             "activity_id": activity_id,
-            "message": "⏳ Still generating. Check status_url.",
-            "status_url": f"/api/status/{activity_id}",
-            "retry_after_seconds": 5,
-        }
-
-    # Failed
-    return {
-        "success": False,
-        "status": status,
-        "prompt": prompt,
-        "model_used": model_used,
-        "activity_id": activity_id,
-        "message": final.get("message", "Generation failed"),
-    }
-
-
-# ==================================================================
-# ============ AUTO — Full auto with internal retries ============
-# ==================================================================
-@app.get("/api/auto", tags=["Generate"])
-async def auto_generate(
-    prompt: str = Query(..., description="Prompt only"),
-    quality: str = Query("low"),
-    aspect_ratio: str = Query("16:9", alias="aspectRatio"),
-    max_wait_seconds: int = Query(45, ge=10, le=120, description="Internal wait budget"),
-):
-    """
-    Full auto: initiate → poll internally up to max_wait_seconds → return URL.
-    Client can call again with the same activity_id if still processing.
-    """
-    payload_base = build_payload(prompt, quality, aspect_ratio)
-    result = await try_generate_with_fallback(payload_base)
-
-    if not result["success"]:
-        return {
-            "success": False,
-            "error": result["error"],
-            "last_error": result.get("last_error"),
-            "prompt": prompt,
-        }
-
-    init_data = result["data"]
-    model_used = result["model_used"]
-    activity_id = (
-        init_data.get("activityId")
-        or init_data.get("data", {}).get("activityId")
-        or init_data.get("id")
+            "status": final["status"],
+            "attempts": final.get("attempts"),
+        },
     )
 
-    if not activity_id:
-        return {"success": False, "error": "No activityId", "response": init_data}
 
-    JOBS[activity_id] = {
-        "activity_id": activity_id,
-        "prompt": prompt,
-        "model": model_used,
-        "initiated_at": datetime.now(timezone.utc).isoformat(),
-        "status": "processing",
-    }
-
-    # Poll internally
-    start = time.time()
-    attempts = 0
-    while time.time() - start < max_wait_seconds:
-        attempts += 1
-        try:
-            res = await get_status(activity_id)
-            data = res.get("data", {})
-            inner = data.get("data", {})
-            status = data.get("status")
-            urls = inner.get("urls", []) or data.get("urls", [])
-
-            if status == "completed" and urls:
-                JOBS[activity_id].update({"status": "completed", "urls": urls})
-                return {
-                    "success": True,
-                    "status": "completed",
-                    "prompt": prompt,
-                    "model_used": model_used,
-                    "image_url": urls[0],
-                    "all_urls": urls,
-                    "thumbnail": inner.get("thumbnail"),
-                    "activity_id": activity_id,
-                    "resolved_prompt": inner.get("resolvedPrompt"),
-                    "created_at": inner.get("createdAt"),
-                    "time_taken_seconds": round(time.time() - start, 1),
-                    "attempts": attempts,
-                }
-
-            if status in ("failed", "error"):
-                return {
-                    "success": False,
-                    "status": status,
-                    "activity_id": activity_id,
-                    "message": data.get("message", "Failed"),
-                }
-        except Exception:
-            pass
-
-        await asyncio.sleep(2)
-
-    return {
-        "success": False,
-        "status": "processing",
-        "prompt": prompt,
-        "model_used": model_used,
-        "activity_id": activity_id,
-        "message": f"⏳ Still generating after {max_wait_seconds}s",
-        "status_url": f"/api/status/{activity_id}",
-        "retry_after_seconds": 5,
-    }
+# ==================================================================
+# ============ SHORTCUT — /api/image?prompt=... ==================
+# ==================================================================
+@app.get("/api/image", tags=["Generate"])
+async def image_shortcut(
+    prompt: str = Query(...),
+    quality: str = Query("low"),
+    aspect_ratio: str = Query("16:9", alias="aspectRatio"),
+    max_wait: int = Query(90, ge=10, le=120),
+):
+    """Alias for /api/generate."""
+    return await generate(prompt=prompt, quality=quality, aspect_ratio=aspect_ratio, max_wait=max_wait)
 
 
 # ==================================================================
-# ============ STATUS ============================================
+# ============ REDIRECT — direct image view =======================
+# ==================================================================
+@app.get("/api/view", tags=["Generate"])
+async def view_image(
+    prompt: str = Query(...),
+    quality: str = Query("low"),
+    aspect_ratio: str = Query("16:9", alias="aspectRatio"),
+    max_wait: int = Query(90, ge=10, le=120),
+):
+    """
+    Generate and redirect directly to the image (for <img src="...">).
+    """
+    try:
+        res = await generate(prompt=prompt, quality=quality, aspect_ratio=aspect_ratio, max_wait=max_wait)
+        return RedirectResponse(url=res["image_url"])
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"success": False, "error": e.detail})
+
+
+# ==================================================================
+# ============ POST version ======================================
+# ==================================================================
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=1000)
+    quality: str = Field("low")
+    aspect_ratio: str = Field("16:9")
+    max_wait: int = Field(90, ge=10, le=120)
+
+
+@app.post("/api/generate", tags=["Generate"])
+async def generate_post(req: GenerateRequest):
+    return await generate(
+        prompt=req.prompt,
+        quality=req.quality,
+        aspect_ratio=req.aspect_ratio,
+        max_wait=req.max_wait,
+    )
+
+
+# ==================================================================
+# ============ STATUS (for re-check) =============================
 # ==================================================================
 @app.get("/api/status/{activity_id}", tags=["Generate"])
-async def get_status_endpoint(activity_id: str):
-    res = await get_status(activity_id)
-    if res["status"] != 200:
-        return {"success": False, "error": "Status check failed", "upstream": res["data"]}
-
-    data = res["data"]
-    inner = data.get("data", {})
-    urls = inner.get("urls", []) or data.get("urls", [])
-    status = data.get("status")
-
-    if activity_id in JOBS:
-        JOBS[activity_id].update({"status": status, "urls": urls})
-
-    response = {
-        "success": data.get("success", True),
-        "activity_id": activity_id,
-        "status": status,
-        "message": data.get("message", ""),
-        "prompt": inner.get("userPrompt"),
-        "model": inner.get("userParams", {}).get("model"),
-        "urls": urls,
-    }
-
-    if status == "completed" and urls:
-        response.update({
-            "is_ready": True,
-            "image_url": urls[0],
-            "thumbnail": inner.get("thumbnail"),
-            "resolved_prompt": inner.get("resolvedPrompt"),
-            "created_at": inner.get("createdAt"),
-        })
-    elif status == "processing":
-        response.update({
-            "is_ready": False,
-            "retry_after_seconds": 3,
-        })
-    else:
-        response["is_ready"] = False
-
-    return response
-
-
-# ==================================================================
-# ============ REDIRECT TO IMAGE =================================
-# ==================================================================
-@app.get("/api/image/{activity_id}", tags=["Generate"])
-async def redirect_to_image(activity_id: str):
+async def check_status(activity_id: str):
+    """Check status of an existing job."""
     res = await get_status(activity_id)
     if res["status"] != 200:
         raise HTTPException(status_code=502, detail="Status check failed")
@@ -489,11 +340,25 @@ async def redirect_to_image(activity_id: str):
     data = res["data"]
     inner = data.get("data", {})
     urls = inner.get("urls", []) or data.get("urls", [])
+    status = data.get("status")
 
-    if data.get("status") != "completed" or not urls:
-        raise HTTPException(status_code=404, detail="Image not ready")
+    if status == "completed" and urls:
+        return {
+            "success": True,
+            "status": "completed",
+            "image_url": urls[0],
+            "all_urls": urls,
+            "prompt": inner.get("userPrompt"),
+            "model": inner.get("userParams", {}).get("model"),
+        }
 
-    return RedirectResponse(url=urls[0])
+    return {
+        "success": True,
+        "status": status,
+        "prompt": inner.get("userPrompt"),
+        "model": inner.get("userParams", {}).get("model"),
+        "urls": urls,
+    }
 
 
 # ==================================================================
@@ -503,13 +368,6 @@ async def redirect_to_image(activity_id: str):
 async def list_jobs():
     jobs = sorted(JOBS.values(), key=lambda x: x.get("initiated_at", ""), reverse=True)
     return {"success": True, "count": len(jobs), "jobs": jobs[:50]}
-
-
-@app.get("/api/jobs/{activity_id}", tags=["System"])
-async def get_job(activity_id: str):
-    if activity_id not in JOBS:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {"success": True, "job": JOBS[activity_id]}
 
 
 # ============ ERROR HANDLERS ============
