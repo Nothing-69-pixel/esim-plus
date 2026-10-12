@@ -1,17 +1,18 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional
 import httpx
 import asyncio
+import base64
 import time
+import os
 from datetime import datetime, timezone
 
 app = FastAPI(
-    title="AI Image Generator & Editor API",
-    description="Generate or edit AI images — powered by template.net",
-    version="6.0.0",
+    title="AI Image Generator + Photo Editor",
+    description="Text-to-Image + Photo Editing via template.net",
+    version="9.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -50,7 +51,6 @@ HEADERS = {
 TIMEOUT = 60.0
 POLL_INTERVAL = 1.0
 
-# Working models (auto-try)
 WORKING_MODELS = [
     "gpt-image-2.5-flare",
     "gpt-image-1",
@@ -59,133 +59,189 @@ WORKING_MODELS = [
     "dall-e-3",
 ]
 
-# Tool configurations
-TOOLS = {
-    "generate": {
-        "slug": "ai-image-generator",
-        "from": "/ai-image-generator__ai-image-generator",
-        "graphicType": "element",
-    },
-    "edit": {
-        "slug": "ai-photo-editor",
-        "from": "/ai-photo-editor__ai-photo-editor",
-        "graphicType": "element",
-    },
-}
+# Upload candidates (auto-tried)
+UPLOAD_ENDPOINTS = [
+    f"{BASE_URL}/api/v3/upload",
+    f"{BASE_URL}/api/v3/image/upload",
+    f"{BASE_URL}/api/v3/images/upload",
+    f"{BASE_URL}/api/v3/uploads",
+    f"{BASE_URL}/api/v3/upload-image",
+    f"{BASE_URL}/api/v3/photo-editor/upload",
+    f"{BASE_URL}/api/v3/image-editor/upload",
+    f"{BASE_URL}/api/v3/files/upload",
+    f"{BASE_URL}/api/v3/media/upload",
+]
 
 JOBS: Dict[str, dict] = {}
 
 
 # ==================================================================
-# ============ HTTP CLIENT =======================================
+# ============ HTTP HELPERS ======================================
 # ==================================================================
-async def post_generate(payload: dict) -> dict:
+async def post_json(url: str, payload: dict, extra_headers: dict = None) -> dict:
+    headers = {**HEADERS}
+    if extra_headers:
+        headers.update(extra_headers)
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-        r = await client.post(GENERATE_URL, json=payload, headers=HEADERS)
         try:
-            data = r.json()
-        except Exception:
-            data = {"_raw": r.text[:500]}
-        return {"status": r.status_code, "data": data}
+            r = await client.post(url, json=payload, headers=headers)
+            return {"status": r.status_code, "data": _safe_json(r)}
+        except Exception as e:
+            return {"status": 0, "error": str(e)[:200]}
+
+
+async def post_multipart(url: str, files: dict, data: dict = None) -> dict:
+    headers = {k: v for k, v in HEADERS.items() if k.lower() != "content-type"}
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+        try:
+            r = await client.post(url, files=files, data=data or {}, headers=headers)
+            return {"status": r.status_code, "data": _safe_json(r)}
+        except Exception as e:
+            return {"status": 0, "error": str(e)[:200]}
 
 
 async def get_status(activity_id: str) -> dict:
     params = {"activityId": activity_id}
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-        r = await client.get(STATUS_URL, params=params, headers=HEADERS)
         try:
-            data = r.json()
-        except Exception:
-            data = {"_raw": r.text[:500]}
-        return {"status": r.status_code, "data": data}
+            r = await client.get(STATUS_URL, params=params, headers=HEADERS)
+            return {"status": r.status_code, "data": _safe_json(r)}
+        except Exception as e:
+            return {"status": 0, "error": str(e)[:200]}
 
 
-async def try_generate(payload_base: dict, models: List[str] = None) -> dict:
-    """Try each model until one succeeds."""
-    models = models or WORKING_MODELS
+def _safe_json(r) -> dict:
+    try:
+        return r.json()
+    except Exception:
+        return {"_raw": r.text[:500]}
+
+
+async def try_initiate(payload_base: dict) -> dict:
+    """Try each model until activityId is returned."""
     last_error = None
-    for model in models:
+    for model in WORKING_MODELS:
         payload = {**payload_base, "model": model}
-        init = await post_generate(payload)
-        status = init.get("status")
-        data = init.get("data", {})
+        res = await post_json(GENERATE_URL, payload)
+        status = res.get("status")
+        data = res.get("data", {})
         activity_id = (
             data.get("activityId")
             or data.get("data", {}).get("activityId")
             or data.get("id")
         )
         if status in (200, 201) and activity_id:
-            return {"success": True, "model_used": model, "activity_id": activity_id, "data": data}
-        last_error = {"model": model, "status": status, "error": str(data)[:200]}
+            return {"success": True, "model_used": model, "activity_id": activity_id}
+        last_error = {"model": model, "status": status, "response": str(data)[:200]}
     return {"success": False, "last_error": last_error}
 
 
-async def poll_until_complete(activity_id: str, max_seconds: int = 90) -> dict:
-    """Poll until image ready or timeout."""
+async def wait_for_image(activity_id: str, max_seconds: int = 90) -> dict:
+    """Poll until image ready."""
     start = time.time()
-    attempt = 0
     while time.time() - start < max_seconds:
-        attempt += 1
         try:
             res = await get_status(activity_id)
             data = res.get("data", {})
-            status = data.get("status")
             inner = data.get("data", {})
+            status = data.get("status")
             urls = inner.get("urls", []) or data.get("urls", [])
 
             if status == "completed" and urls:
                 return {
                     "success": True,
-                    "status": "completed",
                     "image_url": urls[0],
                     "all_urls": urls,
-                    "thumbnail": inner.get("thumbnail") or data.get("thumbnail"),
                     "resolved_prompt": inner.get("resolvedPrompt") or data.get("resolvedPrompt"),
-                    "created_at": inner.get("createdAt") or data.get("createdAt"),
-                    "attempts": attempt,
                     "time_taken": round(time.time() - start, 1),
                 }
-
             if status in ("failed", "error"):
-                return {
-                    "success": False,
-                    "status": status,
-                    "message": data.get("message", "Failed"),
-                    "attempts": attempt,
-                }
+                return {"success": False, "message": data.get("message", "Failed")}
         except Exception:
             pass
         await asyncio.sleep(POLL_INTERVAL)
-
-    return {"success": False, "status": "timeout", "message": f"Timeout after {max_seconds}s", "attempts": attempt}
+    return {"success": False, "message": f"Timeout after {max_seconds}s"}
 
 
 # ==================================================================
-# ============ PAYLOAD BUILDERS ==================================
+# ============ UPLOAD HELPERS (multi-strategy) ===================
 # ==================================================================
-def build_generate_payload(prompt: str, quality: str = "low", aspect_ratio: str = "16:9") -> dict:
-    """Text-to-image generation."""
-    return {
-        "toolPrompt": "",
-        "userPrompt": prompt,
-        "quality": quality,
-        "aspectRatio": aspect_ratio,
-        "tool": {**TOOLS["generate"], "isPanelCall": False},
-    }
+async def upload_image(image_bytes: bytes, filename: str, content_type: str) -> dict:
+    """
+    Upload image to template.net. Tries multiple strategies:
+    1. Multipart to each candidate endpoint
+    2. JSON base64 to each candidate endpoint
+    Returns: {"success": bool, "image_url": str, "endpoint": str, "raw": dict}
+    """
+    errors = []
 
+    # Strategy 1: Multipart
+    for url in UPLOAD_ENDPOINTS:
+        files = {"file": (filename, image_bytes, content_type)}
+        res = await post_multipart(url, files)
+        if res.get("status") in (200, 201):
+            data = res.get("data", {})
+            image_url = (
+                data.get("url") or data.get("imageUrl") or data.get("image_url")
+                or data.get("data", {}).get("url") or data.get("data", {}).get("imageUrl")
+                or data.get("path")
+            )
+            if image_url:
+                if image_url.startswith("/"):
+                    image_url = f"https://www.template.net{image_url}"
+                return {
+                    "success": True,
+                    "image_url": image_url,
+                    "endpoint": url,
+                    "method": "multipart",
+                    "raw": data,
+                }
+        errors.append({"url": url, "method": "multipart", "status": res.get("status"), "response": str(res.get("data"))[:150]})
 
-def build_edit_payload(
-    user_prompt: str,
-    tool_prompt: str = "Edit the attached photo",
-    quality: str = "low",
-) -> dict:
-    """Photo editing (image + prompt)."""
-    return {
-        "toolPrompt": tool_prompt,
-        "userPrompt": user_prompt,
-        "quality": quality,
-        "tool": {**TOOLS["edit"], "isPanelCall": False},
-    }
+    # Strategy 2: field name "image"
+    for url in UPLOAD_ENDPOINTS[:3]:
+        files = {"image": (filename, image_bytes, content_type)}
+        res = await post_multipart(url, files)
+        if res.get("status") in (200, 201):
+            data = res.get("data", {})
+            image_url = (
+                data.get("url") or data.get("imageUrl") or data.get("image_url")
+                or data.get("data", {}).get("url")
+            )
+            if image_url:
+                return {
+                    "success": True,
+                    "image_url": image_url,
+                    "endpoint": url,
+                    "method": "multipart_image",
+                    "raw": data,
+                }
+
+    # Strategy 3: JSON base64
+    b64 = base64.b64encode(image_bytes).decode()
+    for url in UPLOAD_ENDPOINTS[:3]:
+        payload = {
+            "image": f"data:{content_type};base64,{b64}",
+            "imageBase64": b64,
+            "filename": filename,
+        }
+        res = await post_json(url, payload)
+        if res.get("status") in (200, 201):
+            data = res.get("data", {})
+            image_url = (
+                data.get("url") or data.get("imageUrl") or data.get("image_url")
+                or data.get("data", {}).get("url")
+            )
+            if image_url:
+                return {
+                    "success": True,
+                    "image_url": image_url,
+                    "endpoint": url,
+                    "method": "json_base64",
+                    "raw": data,
+                }
+
+    return {"success": False, "errors": errors}
 
 
 # ==================================================================
@@ -195,15 +251,15 @@ def build_edit_payload(
 async def root():
     return {
         "success": True,
-        "service": "AI Image Generator & Editor API",
-        "version": "6.0.0",
+        "service": "AI Image Generator + Photo Editor",
+        "version": "9.0.0",
         "endpoints": {
-            "generate": "/api/generate?prompt=A%20cute%20cat",
-            "edit": "/api/edit?prompt=Make%20it%20brighter",
-            "edit_with_image": "POST /api/edit-upload (multipart with image)",
-            "status": "/api/status/{activity_id}",
-            "jobs": "/api/jobs",
-            "health": "/api/health",
+            "generate": "GET /api/generate?prompt=cat",
+            "edit_upload": "POST /api/edit (multipart: image + prompt)",
+            "edit_url": "GET /api/edit-url?image_url=...&prompt=...",
+            "discover_upload": "GET /api/discover-upload",
+            "jobs": "GET /api/jobs",
+            "health": "GET /api/health",
         },
     }
 
@@ -211,6 +267,44 @@ async def root():
 @app.get("/api/health", tags=["System"])
 async def health():
     return {"success": True, "status": "healthy", "jobs": len(JOBS)}
+
+
+# ==================================================================
+# ============ DISCOVERY — find working upload endpoint ==========
+# ==================================================================
+@app.get("/api/discover-upload", tags=["System"])
+async def discover_upload():
+    """Probe upload endpoints with a tiny test image."""
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    results = []
+    for url in UPLOAD_ENDPOINTS:
+        # Try multipart with "file"
+        r1 = await post_multipart(url, {"file": ("test.png", tiny_png, "image/png")})
+        results.append({
+            "url": url,
+            "method": "multipart/file",
+            "status": r1.get("status"),
+            "response": str(r1.get("data"))[:200],
+        })
+        # Try multipart with "image"
+        r2 = await post_multipart(url, {"image": ("test.png", tiny_png, "image/png")})
+        results.append({
+            "url": url,
+            "method": "multipart/image",
+            "status": r2.get("status"),
+            "response": str(r2.get("data"))[:200],
+        })
+
+    working = [r for r in results if r.get("status") in (200, 201)]
+    return {
+        "total_tested": len(results),
+        "working_count": len(working),
+        "working": working,
+        "all": results,
+    }
 
 
 # ==================================================================
@@ -223,268 +317,215 @@ async def generate(
     aspect_ratio: str = Query("16:9", alias="aspectRatio"),
     max_wait: int = Query(90, ge=10, le=120),
 ):
-    """Generate image from text prompt. Waits until complete."""
-    payload_base = build_generate_payload(prompt, quality, aspect_ratio)
-    result = await try_generate(payload_base)
+    payload_base = {
+        "toolPrompt": "",
+        "userPrompt": prompt,
+        "quality": quality,
+        "aspectRatio": aspect_ratio,
+        "tool": {
+            "slug": "ai-image-generator",
+            "graphicType": "element",
+            "from": "/ai-image-generator__ai-image-generator",
+            "isPanelCall": False,
+        },
+    }
 
-    if not result["success"]:
-        raise HTTPException(502, f"Initiate failed: {result.get('last_error')}")
+    init = await try_initiate(payload_base)
+    if not init["success"]:
+        raise HTTPException(502, {"error": "Initiate failed", "last_error": init.get("last_error")})
 
-    activity_id = result["activity_id"]
-    model_used = result["model_used"]
+    JOBS[init["activity_id"]] = {
+        "prompt": prompt, "model": init["model_used"], "tool": "generate",
+        "started": datetime.now(timezone.utc).isoformat(),
+    }
 
-    JOBS[activity_id] = {
-        "activity_id": activity_id,
-        "prompt": prompt,
-        "model": model_used,
+    final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
+    if not final["success"]:
+        raise HTTPException(500, final.get("message", "Failed"))
+
+    JOBS[init["activity_id"]]["image_url"] = final["image_url"]
+
+    return {
+        "success": True,
         "tool": "generate",
-        "initiated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    final = await poll_until_complete(activity_id, max_seconds=max_wait)
-
-    if final["success"]:
-        JOBS[activity_id].update({"status": "completed", "image_url": final["image_url"]})
-        return {
-            "success": True,
-            "tool": "generate",
-            "prompt": prompt,
-            "model_used": model_used,
-            "image_url": final["image_url"],
-            "all_urls": final["all_urls"],
-            "thumbnail": final.get("thumbnail"),
-            "resolved_prompt": final.get("resolved_prompt"),
-            "activity_id": activity_id,
-            "time_taken_seconds": final.get("time_taken"),
-        }
-
-    JOBS[activity_id].update({"status": final["status"]})
-    raise HTTPException(500, final.get("message", "Failed"))
-
-
-# ==================================================================
-# ============ EDIT — text-only (no image upload) ================
-# ==================================================================
-@app.get("/api/edit", tags=["Edit"])
-async def edit(
-    prompt: str = Query(..., description="Edit instructions e.g. 'Make it brighter'"),
-    tool_prompt: str = Query("Edit the attached photo", alias="toolPrompt"),
-    quality: str = Query("low"),
-    max_wait: int = Query(90, ge=10, le=120),
-):
-    """
-    Edit image using prompt only.
-    NOTE: template.net usually needs an uploaded image for photo editor.
-    If no image is provided, this may fail — use /api/edit-upload instead.
-    """
-    payload_base = build_edit_payload(prompt, tool_prompt, quality)
-    result = await try_generate(payload_base)
-
-    if not result["success"]:
-        raise HTTPException(502, {
-            "message": "Initiate failed. Photo editor needs an uploaded image.",
-            "last_error": result.get("last_error"),
-            "hint": "Use POST /api/edit-upload with multipart form-data (image + prompt)",
-        })
-
-    activity_id = result["activity_id"]
-    model_used = result["model_used"]
-
-    JOBS[activity_id] = {
-        "activity_id": activity_id,
         "prompt": prompt,
-        "tool_prompt": tool_prompt,
-        "model": model_used,
-        "tool": "edit",
-        "initiated_at": datetime.now(timezone.utc).isoformat(),
+        "model_used": init["model_used"],
+        "image_url": final["image_url"],
+        "all_urls": final["all_urls"],
+        "activity_id": init["activity_id"],
+        "time_taken_seconds": final["time_taken"],
     }
 
-    final = await poll_until_complete(activity_id, max_seconds=max_wait)
-
-    if final["success"]:
-        JOBS[activity_id].update({"status": "completed", "image_url": final["image_url"]})
-        return {
-            "success": True,
-            "tool": "edit",
-            "prompt": prompt,
-            "model_used": model_used,
-            "image_url": final["image_url"],
-            "all_urls": final["all_urls"],
-            "activity_id": activity_id,
-            "time_taken_seconds": final.get("time_taken"),
-        }
-
-    JOBS[activity_id].update({"status": final["status"]})
-    raise HTTPException(500, final.get("message", "Failed"))
-
 
 # ==================================================================
-# ============ EDIT with IMAGE UPLOAD ⭐ =========================
+# ============ EDIT — Upload + Prompt ============================
 # ==================================================================
-@app.post("/api/edit-upload", tags=["Edit"])
-async def edit_upload(
+@app.post("/api/edit", tags=["Edit"])
+async def edit(
+    image: UploadFile = File(..., description="Image to edit"),
     prompt: str = Form(..., description="Edit instructions"),
-    tool_prompt: str = Form("Edit the attached photo"),
     quality: str = Form("low"),
     max_wait: int = Form(90),
-    image: UploadFile = File(..., description="Image to edit"),
 ):
     """
-    Upload an image + prompt → edit it.
-    Uses multipart/form-data.
+    Complete flow:
+    1. Upload image to template.net
+    2. Initiate photo editor with image URL + prompt
+    3. Poll until edited image ready
+    4. Return edited image URL
     """
     image_bytes = await image.read()
     if not image_bytes:
         raise HTTPException(400, "Empty image")
 
-    # Try both approaches — some APIs need JSON w/ image URL, some need multipart
-    # First try: JSON with base64 image
-    import base64
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Image too large (max 10MB)")
+
+    filename = image.filename or "photo.png"
+    content_type = image.content_type or "image/png"
+
+    # ── Strategy A: Direct JSON base64 with photo-editor tool ──
     b64 = base64.b64encode(image_bytes).decode()
-
-    payload = {
-        **build_edit_payload(prompt, tool_prompt, quality),
-        "imageBase64": b64,
-        "imageName": image.filename or "upload.png",
-    }
-
-    # Try each model
-    result = await try_generate(payload)
-
-    if not result["success"]:
-        # Try multipart form upload
-        return await try_multipart_upload(image_bytes, image.filename, prompt, tool_prompt, quality, max_wait)
-
-    activity_id = result["activity_id"]
-    model_used = result["model_used"]
-
-    JOBS[activity_id] = {
-        "activity_id": activity_id,
-        "prompt": prompt,
-        "model": model_used,
-        "tool": "edit",
-        "initiated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    final = await poll_until_complete(activity_id, max_seconds=max_wait)
-
-    if final["success"]:
-        return {
-            "success": True,
-            "tool": "edit",
-            "prompt": prompt,
-            "model_used": model_used,
-            "image_url": final["image_url"],
-            "all_urls": final["all_urls"],
-            "activity_id": activity_id,
-            "time_taken_seconds": final.get("time_taken"),
-            "method": "json_base64",
-        }
-
-    raise HTTPException(500, final.get("message", "Failed"))
-
-
-async def try_multipart_upload(
-    image_bytes: bytes, filename: str, prompt: str,
-    tool_prompt: str, quality: str, max_wait: int,
-) -> dict:
-    """Fallback: multipart form-data upload."""
-    files = {"image": (filename or "upload.png", image_bytes, "image/png")}
-    data = {
-        "toolPrompt": tool_prompt,
+    payload_base = {
+        "toolPrompt": "Edit the attached photo",
         "userPrompt": prompt,
         "quality": quality,
-        "model": WORKING_MODELS[0],
+        "imageBase64": b64,
+        "imageName": filename,
+        "tool": {
+            "slug": "ai-photo-editor",
+            "graphicType": "element",
+            "from": "/ai-photo-editor__ai-photo-editor",
+            "isPanelCall": False,
+        },
     }
 
-    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-        r = await client.post(
-            GENERATE_URL,
-            files=files,
-            data=data,
-            headers={k: v for k, v in HEADERS.items() if k.lower() != "content-type"},
-        )
-        try:
-            resp = r.json()
-        except Exception:
-            resp = {"_raw": r.text[:500]}
+    init = await try_initiate(payload_base)
+    method_used = "json_base64"
 
-    activity_id = (
-        resp.get("activityId")
-        or resp.get("data", {}).get("activityId")
-        or resp.get("id")
-    )
+    # ── Strategy B: Upload image first, then use URL ──
+    if not init["success"]:
+        upload_result = await upload_image(image_bytes, filename, content_type)
+        if upload_result.get("success"):
+            # Retry with imageUrl
+            payload_base["imageUrl"] = upload_result["image_url"]
+            payload_base.pop("imageBase64", None)
+            payload_base.pop("imageName", None)
+            init = await try_initiate(payload_base)
+            method_used = f"upload_{upload_result['method']}"
 
-    if not activity_id:
-        raise HTTPException(500, {
-            "message": "Both JSON and multipart uploads failed",
-            "response": resp,
+    # ── Strategy C: Multipart to generate endpoint ──
+    if not init["success"]:
+        for model in WORKING_MODELS:
+            files = {"image": (filename, image_bytes, content_type)}
+            data = {
+                "toolPrompt": "Edit the attached photo",
+                "userPrompt": prompt,
+                "quality": quality,
+                "model": model,
+                "tool[slug]": "ai-photo-editor",
+                "tool[graphicType]": "element",
+                "tool[from]": "/ai-photo-editor__ai-photo-editor",
+                "tool[isPanelCall]": "false",
+            }
+            res = await post_multipart(GENERATE_URL, files, data)
+            if res.get("status") in (200, 201):
+                resp_data = res.get("data", {})
+                aid = (
+                    resp_data.get("activityId")
+                    or resp_data.get("data", {}).get("activityId")
+                    or resp_data.get("id")
+                )
+                if aid:
+                    init = {"success": True, "model_used": model, "activity_id": aid}
+                    method_used = "multipart_generate"
+                    break
+
+    if not init["success"]:
+        raise HTTPException(502, {
+            "error": "All edit strategies failed",
+            "last_error": init.get("last_error"),
+            "hint": "Try /api/discover-upload to find working upload endpoint",
         })
 
-    final = await poll_until_complete(activity_id, max_seconds=max_wait)
+    JOBS[init["activity_id"]] = {
+        "prompt": prompt, "model": init["model_used"], "tool": "edit",
+        "method": method_used,
+        "started": datetime.now(timezone.utc).isoformat(),
+    }
 
-    if final["success"]:
-        return {
-            "success": True,
-            "tool": "edit",
-            "prompt": prompt,
-            "image_url": final["image_url"],
-            "all_urls": final["all_urls"],
-            "activity_id": activity_id,
-            "time_taken_seconds": final.get("time_taken"),
-            "method": "multipart",
-        }
+    final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
+    if not final["success"]:
+        raise HTTPException(500, final.get("message", "Edit failed"))
 
-    raise HTTPException(500, final.get("message", "Failed"))
+    JOBS[init["activity_id"]]["image_url"] = final["image_url"]
+
+    return {
+        "success": True,
+        "tool": "edit",
+        "prompt": prompt,
+        "model_used": init["model_used"],
+        "method": method_used,
+        "image_url": final["image_url"],
+        "all_urls": final["all_urls"],
+        "activity_id": init["activity_id"],
+        "time_taken_seconds": final["time_taken"],
+    }
 
 
 # ==================================================================
-# ============ VIEW — direct image redirect =====================
+# ============ EDIT via Image URL ================================
 # ==================================================================
-@app.get("/api/view", tags=["Generate"])
-async def view_image(
-    prompt: str = Query(...),
+@app.get("/api/edit-url", tags=["Edit"])
+async def edit_url(
+    image_url: str = Query(..., description="Public URL of image to edit"),
+    prompt: str = Query(..., description="Edit instructions"),
     quality: str = Query("low"),
-    aspect_ratio: str = Query("16:9", alias="aspectRatio"),
     max_wait: int = Query(90, ge=10, le=120),
 ):
-    try:
-        res = await generate(prompt=prompt, quality=quality, aspect_ratio=aspect_ratio, max_wait=max_wait)
-        return RedirectResponse(url=res["image_url"])
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"success": False, "error": e.detail})
+    """Edit image from a URL (no file upload)."""
+    payload_base = {
+        "toolPrompt": "Edit the attached photo",
+        "userPrompt": prompt,
+        "quality": quality,
+        "imageUrl": image_url,
+        "tool": {
+            "slug": "ai-photo-editor",
+            "graphicType": "element",
+            "from": "/ai-photo-editor__ai-photo-editor",
+            "isPanelCall": False,
+        },
+    }
 
+    init = await try_initiate(payload_base)
+    if not init["success"]:
+        raise HTTPException(502, {"error": "Initiate failed", "details": init.get("last_error")})
 
-# ==================================================================
-# ============ POST /api/generate ================================
-# ==================================================================
-class GenerateRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, max_length=1000)
-    quality: str = "low"
-    aspect_ratio: str = "16:9"
-    max_wait: int = Field(90, ge=10, le=120)
+    final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
+    if not final["success"]:
+        raise HTTPException(500, final.get("message", "Failed"))
 
-
-@app.post("/api/generate", tags=["Generate"])
-async def generate_post(req: GenerateRequest):
-    return await generate(
-        prompt=req.prompt,
-        quality=req.quality,
-        aspect_ratio=req.aspect_ratio,
-        max_wait=req.max_wait,
-    )
+    return {
+        "success": True,
+        "tool": "edit",
+        "prompt": prompt,
+        "image_url": final["image_url"],
+        "all_urls": final["all_urls"],
+        "activity_id": init["activity_id"],
+        "time_taken_seconds": final["time_taken"],
+    }
 
 
 # ==================================================================
 # ============ STATUS ============================================
 # ==================================================================
-@app.get("/api/status/{activity_id}", tags=["Generate"])
+@app.get("/api/status/{activity_id}", tags=["System"])
 async def check_status(activity_id: str):
     res = await get_status(activity_id)
-    if res["status"] != 200:
+    if res.get("status") != 200:
         raise HTTPException(502, "Status check failed")
 
-    data = res["data"]
+    data = res.get("data", {})
     inner = data.get("data", {})
     urls = inner.get("urls", []) or data.get("urls", [])
     status = data.get("status")
@@ -495,15 +536,11 @@ async def check_status(activity_id: str):
             "status": "completed",
             "image_url": urls[0],
             "all_urls": urls,
-            "prompt": inner.get("userPrompt"),
-            "model": inner.get("userParams", {}).get("model"),
         }
-
     return {
         "success": True,
         "status": status,
         "prompt": inner.get("userPrompt"),
-        "model": inner.get("userParams", {}).get("model"),
         "urls": urls,
     }
 
@@ -513,7 +550,7 @@ async def check_status(activity_id: str):
 # ==================================================================
 @app.get("/api/jobs", tags=["System"])
 async def list_jobs():
-    jobs = sorted(JOBS.values(), key=lambda x: x.get("initiated_at", ""), reverse=True)
+    jobs = sorted(JOBS.values(), key=lambda x: x.get("started", ""), reverse=True)
     return {"success": True, "count": len(jobs), "jobs": jobs[:50]}
 
 
