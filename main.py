@@ -1,17 +1,18 @@
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
-from bs4 import BeautifulSoup
 import httpx
-import re
 import asyncio
-import json
+import re
+import time
+from datetime import datetime, timezone
 
 app = FastAPI(
-    title="SMS24 API",
-    description="Temporary phone numbers + SMS reader — powered by sms24.me",
-    version="1.0.0",
+    title="AI Image Generator API",
+    description="Generate AI images via template.net — auto-detects available models",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -26,511 +27,560 @@ app.add_middleware(
 )
 
 # ============ CONSTANTS ============
-BASE_URL = "https://sms24.me"
-NUMBERS_PAGE = f"{BASE_URL}/en/numbers"
-COUNTRIES_PAGE = f"{BASE_URL}/en/countries"
-API_MESSAGES = f"{BASE_URL}/api/messages"
+BASE_URL = "https://ai-tool-service.template.net"
+GENERATE_URL = f"{BASE_URL}/api/v3/image-generate-by-model"
+STATUS_URL = f"{BASE_URL}/api/v3/image-generation/status"
+MODELS_URL = f"{BASE_URL}/api/v3/image-generation/models"  # guessed
+TEMPLATE_PAGE = "https://www.template.net/ai-image-generator"
 
-BASE_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 13; M2103K19I Build/TP1A.220624.014) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/153.0.8010.36 Mobile Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-User": "?1",
-    "Sec-Fetch-Dest": "document",
-}
-
-API_HEADERS_TEMPLATE = {
-    "User-Agent": BASE_HEADERS["User-Agent"],
-    "Accept": "application/json",
-    "Accept-Language": "en",
-    "Accept-Encoding": "gzip, deflate",
     "Content-Type": "application/json",
-    "Origin": BASE_URL,
-    "Sec-Fetch-Site": "same-origin",
+    "Origin": "https://www.template.net",
+    "Referer": "https://www.template.net/",
+    "Sec-Fetch-Site": "same-site",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
-    "X-Requested-With": "XMLHttpRequest",
-    "sec-ch-ua": '"Android WebView";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
-    "sec-ch-ua-mobile": "?1",
-    "sec-ch-ua-platform": '"Android"',
 }
 
-TIMEOUT = 25.0
+TIMEOUT = 30.0
+POLL_TIMEOUT = 60.0
+POLL_INTERVAL = 2.0
+
+# Model cache (avoids re-fetching every request)
+MODEL_CACHE: Dict = {"models": [], "fetched_at": 0}
+CACHE_TTL = 3600  # 1 hour
+FALLBACK_MODELS = ["gpt-image-2.5-flare", "gpt-image-1", "dall-e-3"]
+
+JOBS: Dict[str, dict] = {}
 
 
 # ==================================================================
-# ============ HTTP HELPERS ======================================
+# ============ MODEL DETECTION ===================================
 # ==================================================================
-async def fetch_html(url: str, cookie: Optional[str] = None, retries: int = 2) -> str:
-    """Fetch HTML listing page."""
-    headers = {**BASE_HEADERS}
-    if cookie:
-        headers["Cookie"] = cookie
+async def fetch_models_from_api() -> Optional[List[dict]]:
+    """Try multiple possible API endpoints for models list."""
+    candidates = [
+        f"{BASE_URL}/api/v3/image-generation/models",
+        f"{BASE_URL}/api/v3/image-generate/models",
+        f"{BASE_URL}/api/v3/models",
+        f"{BASE_URL}/api/v3/image-generation/model-list",
+    ]
 
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            async with httpx.AsyncClient(
-                timeout=TIMEOUT,
-                follow_redirects=True,
-                headers=headers,
-                limits=httpx.Limits(max_keepalive_connections=0),
-            ) as client:
-                r = await client.get(url)
-                if r.status_code == 200:
-                    return r.text
-                last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = str(e)[:150]
-        if attempt < retries:
-            await asyncio.sleep(0.8)
-
-    raise HTTPException(status_code=502, detail=f"Fetch failed: {last_err}")
-
-
-async def call_messages_api(
-    phone: str,
-    page: int = 1,
-    locale: str = "en",
-    cookie: Optional[str] = None,
-    turnstile_token: Optional[str] = None,
-) -> dict:
-    """Call the sms24.me messages API."""
-    url = f"{API_MESSAGES}/{phone}"
-    headers = {**API_HEADERS_TEMPLATE}
-    headers["Referer"] = f"{BASE_URL}/{locale}/numbers/{phone}"
-    if cookie:
-        headers["Cookie"] = cookie
-    if turnstile_token:
-        headers["x-turnstile-token"] = turnstile_token
-
-    payload = {"page": page, "locale": locale}
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=TIMEOUT,
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            r = await client.post(url, json=payload)
-            if r.status_code != 200:
-                return {
-                    "_error": True,
-                    "_status": r.status_code,
-                    "_body": r.text[:1000],
-                }
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        for url in candidates:
             try:
-                return r.json()
+                r = await client.get(url, headers=HEADERS)
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        models = extract_models_from_json(data)
+                        if models:
+                            return models
+                    except Exception:
+                        continue
             except Exception:
-                return {"_raw": r.text[:2000], "_status": r.status_code}
-    except Exception as e:
-        return {"_error": True, "_exception": str(e)[:300]}
+                continue
+    return None
 
 
-# ==================================================================
-# ============ PARSERS ===========================================
-# ==================================================================
-def parse_numbers(html: str) -> List[dict]:
-    """Parse phone numbers from listing page."""
-    soup = BeautifulSoup(html, "html.parser")
-    numbers = []
-    seen = set()
+def extract_models_from_json(data) -> List[dict]:
+    """Extract model list from various JSON shapes."""
+    models = []
 
-    # Match /en/numbers/{digits} links
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        m = re.search(r"/en/numbers/(\d{6,15})", href)
-        if not m:
-            continue
-        phone = m.group(1)
-        if phone in seen:
-            continue
-        seen.add(phone)
+    # Direct list of strings
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                models.append({"id": item, "name": item})
+            elif isinstance(item, dict):
+                mid = item.get("id") or item.get("name") or item.get("slug")
+                if mid:
+                    models.append({
+                        "id": mid,
+                        "name": item.get("label") or item.get("title") or mid,
+                        "raw": item,
+                    })
+        return models
 
-        # Friendly number
-        text = a.get_text(separator=" ", strip=True)
-        fm = re.search(r"\+\d[\d\s\-]+", text)
-        friendly = fm.group(0).strip() if fm else f"+{phone}"
+    # Dict with models/data key
+    if isinstance(data, dict):
+        for key in ["models", "data", "items", "list", "availableModels"]:
+            if key in data:
+                return extract_models_from_json(data[key])
 
-        # Country flag
-        country = ""
-        flag_span = a.find("span", class_=re.compile(r"flag-emoji", re.I))
-        if flag_span:
-            country = flag_span.get_text(strip=True)
-
-        # Country name from h3
-        h3 = a.find("h3")
-        if h3:
-            country = h3.get_text(strip=True)
-
-        numbers.append({
-            "phone_number": phone,
-            "friendly_number": friendly,
-            "country": country,
-            "detail_url": f"{BASE_URL}/en/numbers/{phone}",
-        })
-
-    return numbers
+    return models
 
 
-def parse_countries(html: str) -> List[dict]:
-    """Parse countries from countries page."""
-    soup = BeautifulSoup(html, "html.parser")
-    countries = []
-    seen = set()
+async def fetch_models_from_html() -> Optional[List[dict]]:
+    """Scrape models from the AI image generator page."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.get(TEMPLATE_PAGE, headers={
+                **HEADERS,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            })
+            if r.status_code != 200:
+                return None
+            html = r.text
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        m = re.search(r"/en/countries/([a-z]{2,3})(?:$|[/?#])", href)
-        if not m:
-            continue
-        cc = m.group(1)
-        if cc in seen:
-            continue
-        seen.add(cc)
+        models = []
+        seen = set()
 
-        # Name from inner text
-        text = a.get_text(separator=" ", strip=True)
-        name = re.sub(r"[^\w\s\-()]+", "", text).strip()
+        # Pattern 1: model IDs like "gpt-image-2.5-flare", "dall-e-3"
+        patterns = [
+            r'"(gpt-image-[\d\.]+-[\w-]+)"',
+            r'"(gpt-image-[\d\.]+)"',
+            r'"(dall-e-[\d\.]+)"',
+            r'"(stable-diffusion[\w\-\.]*)"',
+            r'"(flux[\w\-\.]*)"',
+            r'"(imagen-[\w\-\.]+)"',
+        ]
 
-        countries.append({
-            "country_code": cc,
-            "name": name or cc.upper(),
-            "url": href,
-        })
+        for pattern in patterns:
+            for m in re.finditer(pattern, html, re.IGNORECASE):
+                mid = m.group(1)
+                if mid not in seen:
+                    seen.add(mid)
+                    models.append({"id": mid, "name": mid, "source": "html"})
 
-    return countries
-
-
-def parse_number_page(html: str) -> dict:
-    """Extract key info from number detail page."""
-    soup = BeautifulSoup(html, "html.parser")
-    info = {}
-
-    title_el = soup.find("title")
-    info["page_title"] = title_el.get_text(strip=True) if title_el else ""
-
-    h1 = soup.find("h1")
-    if h1:
-        info["friendly_number"] = h1.get_text(strip=True)
-
-    # data-endpoint attribute
-    gate = soup.find(attrs={"data-endpoint": True})
-    if gate:
-        info["messages_api_url"] = gate.get("data-endpoint")
-
-    # Turnstile site key
-    ts = soup.find("meta", attrs={"name": "turnstile-site-key"})
-    if ts:
-        info["turnstile_site_key"] = ts.get("content")
-
-    return info
+        return models if models else None
+    except Exception:
+        return None
 
 
-def extract_otp(body: str) -> List[str]:
-    """Extract OTP-like codes from message body."""
-    if not body:
-        return []
-    codes = re.findall(r"\b\d{4,8}\b", body)
-    # Filter out years and obvious non-OTPs (optional)
-    return sorted(set(codes))
+async def get_available_models(force_refresh: bool = False) -> List[dict]:
+    """
+    Get list of available models. Caches for 1 hour.
+    Tries API first, then HTML scrape, then fallback.
+    """
+    now = time.time()
+
+    if not force_refresh and MODEL_CACHE["models"] and (now - MODEL_CACHE["fetched_at"] < CACHE_TTL):
+        return MODEL_CACHE["models"]
+
+    # Try API
+    models = await fetch_models_from_api()
+
+    # Try HTML scrape
+    if not models:
+        models = await fetch_models_from_html()
+
+    # Fallback
+    if not models:
+        models = [{"id": m, "name": m, "source": "fallback"} for m in FALLBACK_MODELS]
+
+    MODEL_CACHE["models"] = models
+    MODEL_CACHE["fetched_at"] = now
+
+    return models
 
 
-def format_message(msg: dict) -> dict:
-    """Format a message from sms24 API."""
-    content = msg.get("content", "")
+async def get_default_model() -> str:
+    """Return first available model as default."""
+    models = await get_available_models()
+    if models:
+        return models[0]["id"]
+    return "gpt-image-2.5-flare"
+
+
+async def validate_model(model: str) -> dict:
+    """Check if model is available. If not, return error with available list."""
+    models = await get_available_models()
+    valid_ids = [m["id"] for m in models]
+
+    if model in valid_ids:
+        return {"valid": True, "model": model}
+
+    # Check case-insensitive
+    for m in models:
+        if m["id"].lower() == model.lower():
+            return {"valid": True, "model": m["id"], "corrected": True}
+
     return {
-        "id": msg.get("id"),
-        "from": msg.get("from", "unknown"),
-        "sender_url": msg.get("senderUrl"),
-        "body": content,
-        "kind": msg.get("kind", "sms"),
-        "received_at": msg.get("created"),
-        "otp_codes": extract_otp(content),
+        "valid": False,
+        "requested": model,
+        "available": valid_ids,
+        "hint": "Use one of the available models",
     }
 
 
 # ==================================================================
-# ============ ROOT ===============================================
+# ============ MODELS ============================================
+# ==================================================================
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., description="Image description", min_length=1, max_length=1000)
+    model: Optional[str] = Field(None, description="Model ID. Leave empty for auto-detect (uses website default)")
+    quality: str = Field("low", description="low, medium, high")
+    aspect_ratio: str = Field("16:9", description="16:9, 1:1, 9:16, 4:3, 3:4")
+    wait: bool = Field(True, description="If true, waits for completion and returns URL")
+
+
+# ==================================================================
+# ============ HTTP CLIENT =======================================
+# ==================================================================
+async def post_generate(payload: dict) -> dict:
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+        r = await client.post(GENERATE_URL, json=payload, headers=HEADERS)
+        return {"status": r.status_code, "data": r.json() if r.content else {}}
+
+
+async def get_status(activity_id: str) -> dict:
+    params = {"activityId": activity_id}
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+        r = await client.get(STATUS_URL, params=params, headers=HEADERS)
+        return {"status": r.status_code, "data": r.json() if r.content else {}}
+
+
+async def wait_for_completion(activity_id: str) -> dict:
+    start = time.time()
+    last = None
+    while time.time() - start < POLL_TIMEOUT:
+        res = await get_status(activity_id)
+        data = res.get("data", {})
+        last = data
+
+        status = data.get("status", "")
+        if status in ("completed", "failed", "error"):
+            return data
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+    if last:
+        last["_timeout"] = True
+    return last or {"status": "timeout", "activityId": activity_id}
+
+
+# ==================================================================
+# ============ ROOT ==============================================
 # ==================================================================
 @app.get("/", tags=["Root"])
 async def root():
     return {
         "success": True,
-        "service": "SMS24 API",
-        "version": "1.0.0",
-        "source": "sms24.me",
+        "service": "AI Image Generator API",
+        "version": "2.0.0",
+        "backend": "template.net",
+        "note": "Model list is auto-fetched. No hardcoded models.",
         "endpoints": {
-            "numbers": "/api/numbers?country=gb",
-            "countries": "/api/countries",
-            "number_info": "/api/number/{phone}",
-            "messages": "/api/messages/{phone}",
-            "messages_full": "/api/messages/{phone}?page=1",
-            "otp_only": "/api/messages/{phone}?otp_only=true",
-            "latest_otp": "/api/latest-otp?country=gb&scan=5",
+            "models": "/api/models",
+            "generate_get": "/api/generate?prompt=a%20cat",
+            "generate_post": "POST /api/generate",
+            "generate_wait": "/api/generate-wait?prompt=a%20cat",
+            "status": "/api/status/{activity_id}",
+            "batch": "POST /api/batch",
+            "jobs": "/api/jobs",
             "health": "/api/health",
         },
-        "note": "Provide ?turnstile=TOKEN and/or ?cookie=YOUR_COOKIE if blocked by Cloudflare.",
     }
 
 
 # ==================================================================
-# ============ HEALTH =============================================
+# ============ HEALTH ============================================
 # ==================================================================
 @app.get("/api/health", tags=["System"])
 async def health():
-    try:
-        async with httpx.AsyncClient(timeout=10.0, headers=BASE_HEADERS) as client:
-            r = await client.get(NUMBERS_PAGE)
-            return {
-                "success": True,
-                "status": "healthy" if r.status_code == 200 else "degraded",
-                "source_status": r.status_code,
-            }
-    except Exception as e:
-        return {"success": False, "error": str(e)[:200]}
+    return {
+        "success": True,
+        "status": "healthy",
+        "jobs_cached": len(JOBS),
+        "models_cached": len(MODEL_CACHE["models"]),
+        "cache_age_seconds": int(time.time() - MODEL_CACHE["fetched_at"]) if MODEL_CACHE["fetched_at"] else None,
+    }
 
 
 # ==================================================================
-# ============ NUMBERS ===========================================
+# ============ MODELS — Auto-Detected ⭐ =========================
 # ==================================================================
-@app.get("/api/numbers", tags=["Numbers"])
-async def list_numbers(
-    country: str = Query(None, description="Country code (gb, us, ca)"),
-    page: int = Query(1, ge=1),
-    cookie: str = Query(None),
-):
-    if country:
-        url = f"{COUNTRIES_PAGE}/{country.lower()}"
+@app.get("/api/models", tags=["Options"])
+async def list_models(refresh: bool = Query(False, description="Force refresh from website")):
+    """
+    List all available AI models.
+    Fetched live from template.net — no hardcoded list.
+    """
+    models = await get_available_models(force_refresh=refresh)
+    default_model = models[0]["id"] if models else None
+
+    return {
+        "success": True,
+        "count": len(models),
+        "default_model": default_model,
+        "models": models,
+        "cached": not refresh,
+        "cache_ttl_seconds": CACHE_TTL,
+        "note": "Use any of these model IDs in /api/generate?model=...",
+    }
+
+
+@app.get("/api/models/refresh", tags=["Options"])
+async def refresh_models():
+    """Force refresh model list."""
+    models = await get_available_models(force_refresh=True)
+    return {
+        "success": True,
+        "count": len(models),
+        "models": models,
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ==================================================================
+# ============ GENERATE (POST) ===================================
+# ==================================================================
+@app.post("/api/generate", tags=["Generate"])
+async def generate_post(req: GenerateRequest):
+    """
+    Generate an AI image from a prompt.
+    Model is auto-detected if not provided.
+    """
+    # Auto-detect model if not provided
+    model = req.model
+    if not model:
+        model = await get_default_model()
     else:
-        url = NUMBERS_PAGE
-    if page > 1:
-        url += f"?page={page}"
+        # Validate model
+        validation = await validate_model(model)
+        if not validation["valid"]:
+            return {
+                "success": False,
+                "error": f"Invalid model: {model}",
+                "available_models": validation["available"],
+                "hint": validation["hint"],
+            }
+        model = validation["model"]
 
-    html = await fetch_html(url, cookie=cookie)
-    numbers = parse_numbers(html)
-
-    return {
-        "success": True,
-        "country": country,
-        "page": page,
-        "count": len(numbers),
-        "numbers": numbers,
+    payload = {
+        "toolPrompt": "",
+        "userPrompt": req.prompt,
+        "model": model,
+        "quality": req.quality,
+        "aspectRatio": req.aspect_ratio,
+        "tool": {
+            "slug": "ai-image-generator",
+            "graphicType": "element",
+            "from": "/ai-image-generator__ai-image-generator",
+            "isPanelCall": False,
+        },
     }
 
-
-# ==================================================================
-# ============ COUNTRIES =========================================
-# ==================================================================
-@app.get("/api/countries", tags=["Numbers"])
-async def list_countries(cookie: str = Query(None)):
-    html = await fetch_html(COUNTRIES_PAGE, cookie=cookie)
-    countries = parse_countries(html)
-    return {"success": True, "count": len(countries), "countries": countries}
-
-
-# ==================================================================
-# ============ NUMBER INFO =======================================
-# ==================================================================
-@app.get("/api/number/{phone_number}", tags=["Numbers"])
-async def number_info(phone_number: str, cookie: str = Query(None)):
-    phone = re.sub(r"\D", "", phone_number)
-    if not phone:
-        raise HTTPException(status_code=400, detail="Invalid phone")
-
-    url = f"{BASE_URL}/en/numbers/{phone}"
-    html = await fetch_html(url, cookie=cookie)
-    info = parse_number_page(html)
-
-    return {
-        "success": True,
-        "phone_number": phone,
-        "url": url,
-        **info,
-    }
-
-
-# ==================================================================
-# ============ MESSAGES ⭐ ========================================
-# ==================================================================
-@app.get("/api/messages/{phone_number}", tags=["Messages"])
-async def get_messages(
-    phone_number: str,
-    page: int = Query(1, ge=1),
-    locale: str = Query("en"),
-    otp_only: bool = Query(False),
-    limit: int = Query(50, ge=1, le=500),
-    cookie: str = Query(None, description="sms24.me cookie (needs cf_clearance)"),
-    turnstile: str = Query(None, description="x-turnstile-token value from browser"),
-):
-    """
-    Fetch SMS messages. Uses sms24.me/api/messages/{phone} (POST).
-
-    **How to get turnstile token:**
-    1. Open https://sms24.me/en/numbers/{phone} in browser
-    2. Click "Show SMS messages" button
-    3. Open DevTools (F12) → Network tab
-    4. Find the POST request to /api/messages/{phone}
-    5. Copy the `x-turnstile-token` header value
-    6. Pass as ?turnstile=...
-    """
-    phone = re.sub(r"\D", "", phone_number)
-    if not phone:
-        raise HTTPException(status_code=400, detail="Invalid phone")
-
-    data = await call_messages_api(
-        phone=phone,
-        page=page,
-        locale=locale,
-        cookie=cookie,
-        turnstile_token=turnstile,
-    )
-
-    # Error handling
-    if isinstance(data, dict) and data.get("_error"):
+    init = await post_generate(payload)
+    if init["status"] not in (200, 201):
         return {
             "success": False,
-            "phone_number": phone,
-            "status": data.get("_status"),
-            "error": data.get("_body") or data.get("_exception"),
-            "hint": (
-                "Cloudflare Turnstile required. Get turnstile token from browser DevTools "
-                "and pass as ?turnstile=..."
-            ),
+            "error": "Failed to initiate generation",
+            "upstream_status": init["status"],
+            "upstream_response": init["data"],
         }
 
-    raw_messages = data.get("messages", []) if isinstance(data, dict) else []
-    formatted = [format_message(m) for m in raw_messages]
+    init_data = init["data"]
+    activity_id = (
+        init_data.get("activityId")
+        or init_data.get("data", {}).get("activityId")
+        or init_data.get("id")
+    )
 
-    if otp_only:
-        formatted = [m for m in formatted if m["otp_codes"]]
+    if not activity_id:
+        return {
+            "success": False,
+            "error": "No activityId in response",
+            "upstream_response": init_data,
+        }
 
-    formatted = formatted[:limit]
+    JOBS[activity_id] = {
+        "activity_id": activity_id,
+        "prompt": req.prompt,
+        "model": model,
+        "quality": req.quality,
+        "aspect_ratio": req.aspect_ratio,
+        "initiated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "processing",
+    }
+
+    if not req.wait:
+        return {
+            "success": True,
+            "activity_id": activity_id,
+            "model": model,
+            "status": "processing",
+            "status_url": f"/api/status/{activity_id}",
+            "message": "Job initiated. Poll /api/status/{activity_id} to check.",
+        }
+
+    result = await wait_for_completion(activity_id)
+    inner = result.get("data", {})
+    urls = inner.get("urls", []) or result.get("urls", [])
+
+    JOBS[activity_id].update({
+        "status": result.get("status"),
+        "urls": urls,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    })
 
     return {
-        "success": True,
-        "phone_number": phone,
-        "page": data.get("page", page) if isinstance(data, dict) else page,
-        "total_pages": data.get("pages", 1) if isinstance(data, dict) else 1,
-        "total": data.get("total", len(formatted)) if isinstance(data, dict) else len(formatted),
-        "otp_only": otp_only,
-        "count": len(formatted),
-        "messages": formatted,
+        "success": result.get("status") == "completed",
+        "activity_id": activity_id,
+        "status": result.get("status"),
+        "message": result.get("message", ""),
+        "prompt": req.prompt,
+        "model": model,
+        "urls": urls,
+        "thumbnail": inner.get("thumbnail") or result.get("thumbnail"),
+        "resolved_prompt": inner.get("resolvedPrompt") or result.get("resolvedPrompt"),
+        "created_at": inner.get("createdAt") or result.get("createdAt"),
     }
 
 
 # ==================================================================
-# ============ MESSAGES RAW (debug) ==============================
+# ============ GENERATE (GET) ====================================
 # ==================================================================
-@app.get("/api/messages-raw/{phone_number}", tags=["Messages"])
-async def get_messages_raw(
-    phone_number: str,
-    page: int = Query(1, ge=1),
-    cookie: str = Query(None),
-    turnstile: str = Query(None),
+@app.get("/api/generate", tags=["Generate"])
+async def generate_get(
+    prompt: str = Query(..., description="Image description"),
+    model: Optional[str] = Query(None, description="Leave empty for auto-detect"),
+    quality: str = Query("low"),
+    aspect_ratio: str = Query("16:9", alias="aspectRatio"),
+    wait: bool = Query(True),
 ):
-    phone = re.sub(r"\D", "", phone_number)
-    if not phone:
-        raise HTTPException(status_code=400, detail="Invalid phone")
+    req = GenerateRequest(
+        prompt=prompt,
+        model=model,
+        quality=quality,
+        aspect_ratio=aspect_ratio,
+        wait=wait,
+    )
+    return await generate_post(req)
 
-    data = await call_messages_api(phone=phone, page=page, cookie=cookie, turnstile_token=turnstile)
+
+# ==================================================================
+# ============ STATUS ============================================
+# ==================================================================
+@app.get("/api/status/{activity_id}", tags=["Generate"])
+async def get_status_endpoint(activity_id: str):
+    res = await get_status(activity_id)
+
+    if res["status"] != 200:
+        return {
+            "success": False,
+            "error": "Failed to fetch status",
+            "upstream_status": res["status"],
+            "upstream_response": res["data"],
+        }
+
+    data = res["data"]
+    inner = data.get("data", {})
+    urls = inner.get("urls", []) or data.get("urls", [])
+
+    if activity_id in JOBS:
+        JOBS[activity_id].update({
+            "status": data.get("status"),
+            "urls": urls,
+            "last_checked": datetime.now(timezone.utc).isoformat(),
+        })
+
     return {
-        "success": True,
-        "phone_number": phone,
-        "raw_response": data,
+        "success": data.get("success", True),
+        "activity_id": activity_id,
+        "status": data.get("status"),
+        "message": data.get("message", ""),
+        "urls": urls,
+        "thumbnail": inner.get("thumbnail") or data.get("thumbnail"),
+        "prompt": inner.get("userPrompt"),
+        "model": inner.get("userParams", {}).get("model"),
+        "aspect_ratio": inner.get("userParams", {}).get("aspectRatio"),
+        "resolved_prompt": inner.get("resolvedPrompt"),
+        "created_at": inner.get("createdAt"),
     }
 
 
 # ==================================================================
-# ============ LATEST OTP — multi-number scan ====================
+# ============ GENERATE-WAIT (one-shot) ==========================
 # ==================================================================
-@app.get("/api/latest-otp", tags=["Messages"])
-async def latest_otp(
-    country: str = Query("gb", description="Country code (gb, us, ca)"),
-    scan: int = Query(5, ge=1, le=15, description="How many numbers to check"),
-    limit: int = Query(30, ge=1, le=100),
-    otp_only: bool = Query(True),
-    cookie: str = Query(None),
-    turnstile: str = Query(None),
+@app.get("/api/generate-wait", tags=["Generate"])
+async def generate_wait(
+    prompt: str = Query(...),
+    model: Optional[str] = Query(None),
+    quality: str = Query("low"),
+    aspect_ratio: str = Query("16:9", alias="aspectRatio"),
 ):
-    """
-    Scan multiple numbers and collect latest OTPs.
-    """
-    # Get numbers
-    url = f"{COUNTRIES_PAGE}/{country.lower()}"
-    html = await fetch_html(url, cookie=cookie)
-    numbers = parse_numbers(html)[:scan]
+    req = GenerateRequest(
+        prompt=prompt,
+        model=model,
+        quality=quality,
+        aspect_ratio=aspect_ratio,
+        wait=True,
+    )
+    return await generate_post(req)
 
-    if not numbers:
-        return {"success": False, "message": "No numbers found"}
 
-    all_otps = []
-    per_number = []
+# ==================================================================
+# ============ JOBS ==============================================
+# ==================================================================
+@app.get("/api/jobs", tags=["System"])
+async def list_jobs():
+    jobs = sorted(JOBS.values(), key=lambda x: x.get("initiated_at", ""), reverse=True)
+    return {"success": True, "count": len(jobs), "jobs": jobs[:50]}
 
-    for n in numbers:
+
+@app.get("/api/jobs/{activity_id}", tags=["System"])
+async def get_job(activity_id: str):
+    if activity_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"success": True, "job": JOBS[activity_id]}
+
+
+# ==================================================================
+# ============ BATCH =============================================
+# ==================================================================
+class BatchRequest(BaseModel):
+    prompts: List[str] = Field(..., min_length=1, max_length=10)
+    model: Optional[str] = None
+    quality: str = "low"
+    aspect_ratio: str = "16:9"
+
+
+@app.post("/api/batch", tags=["Generate"])
+async def batch_generate(req: BatchRequest):
+    results = []
+
+    # Resolve model once
+    model = req.model or await get_default_model()
+
+    for prompt in req.prompts:
         try:
-            data = await call_messages_api(
-                phone=n["phone_number"],
-                cookie=cookie,
-                turnstile_token=turnstile,
+            gen_req = GenerateRequest(
+                prompt=prompt,
+                model=model,
+                quality=req.quality,
+                aspect_ratio=req.aspect_ratio,
+                wait=False,
             )
-            if isinstance(data, dict) and data.get("_error"):
-                per_number.append({
-                    "phone_number": n["phone_number"],
-                    "success": False,
-                    "error": str(data.get("_status")),
-                })
-                continue
-
-            raw_msgs = data.get("messages", []) if isinstance(data, dict) else []
-            formatted = [format_message(m) for m in raw_msgs]
-
-            if otp_only:
-                formatted = [m for m in formatted if m["otp_codes"]]
-
-            per_number.append({
-                "phone_number": n["phone_number"],
-                "friendly_number": n["friendly_number"],
-                "success": True,
-                "message_count": len(formatted),
+            res = await generate_post(gen_req)
+            results.append({
+                "prompt": prompt,
+                "success": res.get("success", False),
+                "activity_id": res.get("activity_id"),
+                "status_url": res.get("status_url"),
+                "error": res.get("error"),
             })
-
-            for m in formatted:
-                all_otps.append({
-                    "phone_number": n["phone_number"],
-                    "friendly_number": n["friendly_number"],
-                    "from": m["from"],
-                    "body": m["body"][:200],
-                    "otp_codes": m["otp_codes"],
-                    "received_at": m["received_at"],
-                })
         except Exception as e:
-            per_number.append({
-                "phone_number": n["phone_number"],
+            results.append({
+                "prompt": prompt,
                 "success": False,
-                "error": str(e)[:150],
+                "error": str(e)[:200],
             })
-
-    all_otps = all_otps[:limit]
 
     return {
         "success": True,
-        "country": country,
-        "scanned": len(numbers),
-        "count": len(all_otps),
-        "otps": all_otps,
-        "per_number": per_number,
+        "count": len(results),
+        "model_used": model,
+        "results": results,
     }
 
 
