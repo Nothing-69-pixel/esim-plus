@@ -1,18 +1,19 @@
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from typing import List, Dict, Optional
 import httpx
 import asyncio
 import base64
 import time
 import os
+import json
 from datetime import datetime, timezone
 
 app = FastAPI(
-    title="AI Image Generator + Photo Editor",
-    description="Text-to-Image + Photo Editing via template.net",
-    version="9.0.0",
+    title="AI Photo Editor API",
+    description="Real photo editing + generation via template.net",
+    version="10.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     default_response_class=JSONResponse,
@@ -26,7 +27,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ CONSTANTS ============
+# ============ CONFIG ============
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
 BASE_URL = "https://ai-tool-service.template.net"
 GENERATE_URL = f"{BASE_URL}/api/v3/image-generate-by-model"
 STATUS_URL = f"{BASE_URL}/api/v3/image-generation/status"
@@ -49,7 +52,7 @@ HEADERS = {
 }
 
 TIMEOUT = 60.0
-POLL_INTERVAL = 1.0
+POLL_INTERVAL = 1.5
 
 WORKING_MODELS = [
     "gpt-image-2.5-flare",
@@ -59,32 +62,43 @@ WORKING_MODELS = [
     "dall-e-3",
 ]
 
-# Upload candidates (auto-tried)
+# Upload candidate endpoints — সব try হবে
 UPLOAD_ENDPOINTS = [
     f"{BASE_URL}/api/v3/upload",
-    f"{BASE_URL}/api/v3/image/upload",
     f"{BASE_URL}/api/v3/images/upload",
-    f"{BASE_URL}/api/v3/uploads",
+    f"{BASE_URL}/api/v3/image/upload",
     f"{BASE_URL}/api/v3/upload-image",
+    f"{BASE_URL}/api/v3/files",
+    f"{BASE_URL}/api/v3/uploads",
+    f"{BASE_URL}/api/v3/media/upload",
+    f"{BASE_URL}/api/v3/workspace/upload",
+    f"{BASE_URL}/api/v3/editor/upload",
     f"{BASE_URL}/api/v3/photo-editor/upload",
     f"{BASE_URL}/api/v3/image-editor/upload",
+    f"{BASE_URL}/api/v3/reference/upload",
+    f"{BASE_URL}/api/v3/attachments/upload",
     f"{BASE_URL}/api/v3/files/upload",
-    f"{BASE_URL}/api/v3/media/upload",
 ]
 
 JOBS: Dict[str, dict] = {}
+UPLOAD_CACHE: Dict = {"endpoint": None, "tested_at": 0}
+UPLOAD_CACHE_TTL = 1800  # 30 min
 
 
 # ==================================================================
 # ============ HTTP HELPERS ======================================
 # ==================================================================
-async def post_json(url: str, payload: dict, extra_headers: dict = None) -> dict:
-    headers = {**HEADERS}
-    if extra_headers:
-        headers.update(extra_headers)
+def _safe_json(r) -> dict:
+    try:
+        return r.json()
+    except Exception:
+        return {"_raw": r.text[:500]}
+
+
+async def post_json(url: str, payload: dict) -> dict:
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
         try:
-            r = await client.post(url, json=payload, headers=headers)
+            r = await client.post(url, json=payload, headers=HEADERS)
             return {"status": r.status_code, "data": _safe_json(r)}
         except Exception as e:
             return {"status": 0, "error": str(e)[:200]}
@@ -101,22 +115,154 @@ async def post_multipart(url: str, files: dict, data: dict = None) -> dict:
 
 
 async def get_status(activity_id: str) -> dict:
-    params = {"activityId": activity_id}
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
         try:
-            r = await client.get(STATUS_URL, params=params, headers=HEADERS)
+            r = await client.get(STATUS_URL, params={"activityId": activity_id}, headers=HEADERS)
             return {"status": r.status_code, "data": _safe_json(r)}
         except Exception as e:
             return {"status": 0, "error": str(e)[:200]}
 
 
-def _safe_json(r) -> dict:
-    try:
-        return r.json()
-    except Exception:
-        return {"_raw": r.text[:500]}
+# ==================================================================
+# ============ UPLOAD DISCOVERY ==================================
+# ==================================================================
+def _extract_image_url(data: dict) -> Optional[str]:
+    """Search nested data for any image URL."""
+    if not isinstance(data, dict):
+        return None
+
+    # Common keys
+    for key in ["url", "imageUrl", "image_url", "path", "file_url", "fileUrl", "src"]:
+        v = data.get(key)
+        if isinstance(v, str) and (v.startswith("http") or v.startswith("/")):
+            return v
+
+    # Nested "data"
+    if "data" in data and isinstance(data["data"], (dict, list)):
+        return _extract_image_url(data["data"]) if isinstance(data["data"], dict) else (
+            _extract_image_url(data["data"][0]) if data["data"] else None
+        )
+
+    # Files list
+    if "files" in data and isinstance(data["files"], list) and data["files"]:
+        return _extract_image_url(data["files"][0])
+
+    return None
 
 
+def _extract_workspace_id(data: dict) -> Optional[int]:
+    """Search for workspaceTemplateId."""
+    if not isinstance(data, dict):
+        return None
+    for key in ["workspaceTemplateId", "workspace_template_id", "workspaceId", "workspace_id"]:
+        v = data.get(key)
+        if isinstance(v, (int, str)) and str(v).isdigit():
+            return int(v)
+    if "data" in data and isinstance(data["data"], dict):
+        return _extract_workspace_id(data["data"])
+    return None
+
+
+async def discover_upload_endpoint(image_bytes: bytes = None, filename: str = "test.png") -> Optional[dict]:
+    """
+    Find a working upload endpoint by probing each candidate.
+    Caches result for UPLOAD_CACHE_TTL.
+    """
+    now = time.time()
+    if UPLOAD_CACHE["endpoint"] and (now - UPLOAD_CACHE["tested_at"] < UPLOAD_CACHE_TTL):
+        return UPLOAD_CACHE["endpoint"]
+
+    if not image_bytes:
+        image_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        filename = "test.png"
+
+    for url in UPLOAD_ENDPOINTS:
+        # Try field "file"
+        r = await post_multipart(url, {"file": (filename, image_bytes, "image/png")})
+        if r.get("status") in (200, 201):
+            img_url = _extract_image_url(r.get("data", {}))
+            ws_id = _extract_workspace_id(r.get("data", {}))
+            if img_url:
+                result = {
+                    "endpoint": url,
+                    "field": "file",
+                    "image_url": img_url,
+                    "workspace_id": ws_id,
+                    "raw": r.get("data"),
+                }
+                UPLOAD_CACHE["endpoint"] = result
+                UPLOAD_CACHE["tested_at"] = now
+                return result
+
+        # Try field "image"
+        r = await post_multipart(url, {"image": (filename, image_bytes, "image/png")})
+        if r.get("status") in (200, 201):
+            img_url = _extract_image_url(r.get("data", {}))
+            ws_id = _extract_workspace_id(r.get("data", {}))
+            if img_url:
+                result = {
+                    "endpoint": url,
+                    "field": "image",
+                    "image_url": img_url,
+                    "workspace_id": ws_id,
+                    "raw": r.get("data"),
+                }
+                UPLOAD_CACHE["endpoint"] = result
+                UPLOAD_CACHE["tested_at"] = now
+                return result
+
+    return None
+
+
+async def upload_image(image_bytes: bytes, filename: str, content_type: str) -> dict:
+    """Upload image using discovered endpoint."""
+    # First, try cached/discovered endpoint
+    endpoint_info = await discover_upload_endpoint(image_bytes, filename)
+
+    if endpoint_info:
+        field = endpoint_info.get("field", "file")
+        endpoint = endpoint_info["endpoint"]
+        files = {field: (filename, image_bytes, content_type)}
+        r = await post_multipart(endpoint, files)
+        if r.get("status") in (200, 201):
+            img_url = _extract_image_url(r.get("data", {}))
+            ws_id = _extract_workspace_id(r.get("data", {}))
+            if img_url:
+                return {
+                    "success": True,
+                    "image_url": img_url,
+                    "workspace_id": ws_id,
+                    "endpoint": endpoint,
+                    "field": field,
+                    "raw": r.get("data"),
+                }
+
+    # Fallback: try all endpoints
+    for url in UPLOAD_ENDPOINTS:
+        for field in ["file", "image", "photo", "media"]:
+            files = {field: (filename, image_bytes, content_type)}
+            r = await post_multipart(url, files)
+            if r.get("status") in (200, 201):
+                img_url = _extract_image_url(r.get("data", {}))
+                if img_url:
+                    return {
+                        "success": True,
+                        "image_url": img_url,
+                        "workspace_id": _extract_workspace_id(r.get("data", {})),
+                        "endpoint": url,
+                        "field": field,
+                        "raw": r.get("data"),
+                    }
+
+    return {"success": False, "error": "No upload endpoint worked"}
+
+
+# ==================================================================
+# ============ GENERATE / EDIT CORE ==============================
+# ==================================================================
 async def try_initiate(payload_base: dict) -> dict:
     """Try each model until activityId is returned."""
     last_error = None
@@ -131,7 +277,12 @@ async def try_initiate(payload_base: dict) -> dict:
             or data.get("id")
         )
         if status in (200, 201) and activity_id:
-            return {"success": True, "model_used": model, "activity_id": activity_id}
+            return {
+                "success": True,
+                "model_used": model,
+                "activity_id": activity_id,
+                "raw": data,
+            }
         last_error = {"model": model, "status": status, "response": str(data)[:200]}
     return {"success": False, "last_error": last_error}
 
@@ -163,99 +314,100 @@ async def wait_for_image(activity_id: str, max_seconds: int = 90) -> dict:
     return {"success": False, "message": f"Timeout after {max_seconds}s"}
 
 
-# ==================================================================
-# ============ UPLOAD HELPERS (multi-strategy) ===================
-# ==================================================================
-async def upload_image(image_bytes: bytes, filename: str, content_type: str) -> dict:
+async def edit_photo_real(image_bytes: bytes, filename: str, content_type: str, prompt: str, quality: str = "low", max_wait: int = 90) -> dict:
     """
-    Upload image to template.net. Tries multiple strategies:
-    1. Multipart to each candidate endpoint
-    2. JSON base64 to each candidate endpoint
-    Returns: {"success": bool, "image_url": str, "endpoint": str, "raw": dict}
+    Real photo editing flow:
+    1. Upload image → get image_url + workspaceTemplateId
+    2. Initiate photo editor with image_url + workspaceTemplateId + prompt
+    3. Wait for completion
     """
-    errors = []
-
-    # Strategy 1: Multipart
-    for url in UPLOAD_ENDPOINTS:
-        files = {"file": (filename, image_bytes, content_type)}
-        res = await post_multipart(url, files)
-        if res.get("status") in (200, 201):
-            data = res.get("data", {})
-            image_url = (
-                data.get("url") or data.get("imageUrl") or data.get("image_url")
-                or data.get("data", {}).get("url") or data.get("data", {}).get("imageUrl")
-                or data.get("path")
-            )
-            if image_url:
-                if image_url.startswith("/"):
-                    image_url = f"https://www.template.net{image_url}"
-                return {
-                    "success": True,
-                    "image_url": image_url,
-                    "endpoint": url,
-                    "method": "multipart",
-                    "raw": data,
-                }
-        errors.append({"url": url, "method": "multipart", "status": res.get("status"), "response": str(res.get("data"))[:150]})
-
-    # Strategy 2: field name "image"
-    for url in UPLOAD_ENDPOINTS[:3]:
-        files = {"image": (filename, image_bytes, content_type)}
-        res = await post_multipart(url, files)
-        if res.get("status") in (200, 201):
-            data = res.get("data", {})
-            image_url = (
-                data.get("url") or data.get("imageUrl") or data.get("image_url")
-                or data.get("data", {}).get("url")
-            )
-            if image_url:
-                return {
-                    "success": True,
-                    "image_url": image_url,
-                    "endpoint": url,
-                    "method": "multipart_image",
-                    "raw": data,
-                }
-
-    # Strategy 3: JSON base64
-    b64 = base64.b64encode(image_bytes).decode()
-    for url in UPLOAD_ENDPOINTS[:3]:
-        payload = {
-            "image": f"data:{content_type};base64,{b64}",
-            "imageBase64": b64,
-            "filename": filename,
+    # ── Step 1: Upload ──
+    upload = await upload_image(image_bytes, filename, content_type)
+    if not upload.get("success"):
+        return {
+            "success": False,
+            "error": "Upload failed",
+            "detail": upload.get("error"),
         }
-        res = await post_json(url, payload)
-        if res.get("status") in (200, 201):
-            data = res.get("data", {})
-            image_url = (
-                data.get("url") or data.get("imageUrl") or data.get("image_url")
-                or data.get("data", {}).get("url")
-            )
-            if image_url:
-                return {
-                    "success": True,
-                    "image_url": image_url,
-                    "endpoint": url,
-                    "method": "json_base64",
-                    "raw": data,
-                }
 
-    return {"success": False, "errors": errors}
+    image_url = upload["image_url"]
+    workspace_id = upload.get("workspace_id")
+
+    # ── Step 2: Initiate photo edit ──
+    payload_base = {
+        "toolPrompt": "Edit the attached photo",
+        "userPrompt": prompt,
+        "quality": quality,
+        "imageUrl": image_url,
+        "tool": {
+            "slug": "ai-photo-editor",
+            "graphicType": "element",
+            "from": "/ai-photo-editor__ai-photo-editor",
+            "isPanelCall": False,
+        },
+    }
+
+    if workspace_id:
+        payload_base["workspaceTemplateId"] = workspace_id
+
+    init = await try_initiate(payload_base)
+
+    # ── Fallback: try with references ──
+    if not init["success"]:
+        payload_base["references"] = [image_url]
+        payload_base["referencesCount"] = 1
+        payload_base.pop("imageUrl", None)
+        init = await try_initiate(payload_base)
+
+    # ── Fallback: try base64 ──
+    if not init["success"]:
+        b64 = base64.b64encode(image_bytes).decode()
+        payload_base["imageBase64"] = b64
+        payload_base["imageName"] = filename
+        payload_base.pop("references", None)
+        payload_base.pop("referencesCount", None)
+        init = await try_initiate(payload_base)
+
+    if not init["success"]:
+        return {
+            "success": False,
+            "error": "Initiate failed",
+            "detail": init.get("last_error"),
+            "upload_info": {
+                "image_url": image_url,
+                "workspace_id": workspace_id,
+            },
+        }
+
+    # ── Step 3: Wait for edited image ──
+    final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
+    if not final["success"]:
+        return {"success": False, "error": final.get("message", "Edit failed")}
+
+    return {
+        "success": True,
+        "image_url": final["image_url"],
+        "all_urls": final["all_urls"],
+        "activity_id": init["activity_id"],
+        "model_used": init["model_used"],
+        "uploaded_image_url": image_url,
+        "workspace_id": workspace_id,
+        "time_taken_seconds": final["time_taken"],
+    }
 
 
 # ==================================================================
-# ============ ROOT ==============================================
+# ============ ROOT / HEALTH =====================================
 # ==================================================================
 @app.get("/", tags=["Root"])
 async def root():
     return {
         "success": True,
-        "service": "AI Image Generator + Photo Editor",
-        "version": "9.0.0",
+        "service": "AI Photo Editor API",
+        "version": "10.0.0",
         "endpoints": {
             "generate": "GET /api/generate?prompt=cat",
-            "edit_upload": "POST /api/edit (multipart: image + prompt)",
+            "edit": "POST /api/edit (image + prompt)",
             "edit_url": "GET /api/edit-url?image_url=...&prompt=...",
             "discover_upload": "GET /api/discover-upload",
             "jobs": "GET /api/jobs",
@@ -266,41 +418,52 @@ async def root():
 
 @app.get("/api/health", tags=["System"])
 async def health():
-    return {"success": True, "status": "healthy", "jobs": len(JOBS)}
+    return {
+        "success": True,
+        "status": "healthy",
+        "upload_endpoint_cached": UPLOAD_CACHE.get("endpoint", {}).get("endpoint") if UPLOAD_CACHE.get("endpoint") else None,
+        "jobs": len(JOBS),
+    }
 
 
 # ==================================================================
-# ============ DISCOVERY — find working upload endpoint ==========
+# ============ DISCOVER UPLOAD ===================================
 # ==================================================================
 @app.get("/api/discover-upload", tags=["System"])
 async def discover_upload():
-    """Probe upload endpoints with a tiny test image."""
+    """Find working upload endpoint."""
+    # Clear cache to force fresh test
+    UPLOAD_CACHE["endpoint"] = None
+    UPLOAD_CACHE["tested_at"] = 0
+
+    result = await discover_upload_endpoint()
+    return {
+        "success": result is not None,
+        "working_endpoint": result,
+        "tested_endpoints": UPLOAD_ENDPOINTS,
+    }
+
+
+@app.get("/api/discover-upload-full", tags=["System"])
+async def discover_upload_full():
+    """Test every endpoint and show all responses."""
     tiny_png = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
         "+A8AAQUBAScY42YAAAAASUVORK5CYII="
     )
     results = []
     for url in UPLOAD_ENDPOINTS:
-        # Try multipart with "file"
-        r1 = await post_multipart(url, {"file": ("test.png", tiny_png, "image/png")})
-        results.append({
-            "url": url,
-            "method": "multipart/file",
-            "status": r1.get("status"),
-            "response": str(r1.get("data"))[:200],
-        })
-        # Try multipart with "image"
-        r2 = await post_multipart(url, {"image": ("test.png", tiny_png, "image/png")})
-        results.append({
-            "url": url,
-            "method": "multipart/image",
-            "status": r2.get("status"),
-            "response": str(r2.get("data"))[:200],
-        })
-
-    working = [r for r in results if r.get("status") in (200, 201)]
+        for field in ["file", "image"]:
+            r = await post_multipart(url, {field: ("test.png", tiny_png, "image/png")})
+            results.append({
+                "url": url,
+                "field": field,
+                "status": r.get("status"),
+                "response": str(r.get("data"))[:250],
+            })
+    working = [x for x in results if x.get("status") in (200, 201)]
     return {
-        "total_tested": len(results),
+        "total": len(results),
         "working_count": len(working),
         "working": working,
         "all": results,
@@ -308,7 +471,7 @@ async def discover_upload():
 
 
 # ==================================================================
-# ============ GENERATE — text to image ==========================
+# ============ GENERATE ==========================================
 # ==================================================================
 @app.get("/api/generate", tags=["Generate"])
 async def generate(
@@ -332,18 +495,11 @@ async def generate(
 
     init = await try_initiate(payload_base)
     if not init["success"]:
-        raise HTTPException(502, {"error": "Initiate failed", "last_error": init.get("last_error")})
-
-    JOBS[init["activity_id"]] = {
-        "prompt": prompt, "model": init["model_used"], "tool": "generate",
-        "started": datetime.now(timezone.utc).isoformat(),
-    }
+        raise HTTPException(502, {"error": "Initiate failed", "detail": init.get("last_error")})
 
     final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
     if not final["success"]:
         raise HTTPException(500, final.get("message", "Failed"))
-
-    JOBS[init["activity_id"]]["image_url"] = final["image_url"]
 
     return {
         "success": True,
@@ -362,128 +518,51 @@ async def generate(
 # ==================================================================
 @app.post("/api/edit", tags=["Edit"])
 async def edit(
-    image: UploadFile = File(..., description="Image to edit"),
-    prompt: str = Form(..., description="Edit instructions"),
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
     quality: str = Form("low"),
     max_wait: int = Form(90),
 ):
-    """
-    Complete flow:
-    1. Upload image to template.net
-    2. Initiate photo editor with image URL + prompt
-    3. Poll until edited image ready
-    4. Return edited image URL
-    """
+    """Upload image + prompt → real photo edit (not regenerate)."""
     image_bytes = await image.read()
     if not image_bytes:
         raise HTTPException(400, "Empty image")
-
     if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(413, "Image too large (max 10MB)")
+        raise HTTPException(413, "Image too large (10MB max)")
 
     filename = image.filename or "photo.png"
     content_type = image.content_type or "image/png"
 
-    # ── Strategy A: Direct JSON base64 with photo-editor tool ──
-    b64 = base64.b64encode(image_bytes).decode()
-    payload_base = {
-        "toolPrompt": "Edit the attached photo",
-        "userPrompt": prompt,
-        "quality": quality,
-        "imageBase64": b64,
-        "imageName": filename,
-        "tool": {
-            "slug": "ai-photo-editor",
-            "graphicType": "element",
-            "from": "/ai-photo-editor__ai-photo-editor",
-            "isPanelCall": False,
-        },
-    }
+    result = await edit_photo_real(image_bytes, filename, content_type, prompt, quality, max_wait)
 
-    init = await try_initiate(payload_base)
-    method_used = "json_base64"
-
-    # ── Strategy B: Upload image first, then use URL ──
-    if not init["success"]:
-        upload_result = await upload_image(image_bytes, filename, content_type)
-        if upload_result.get("success"):
-            # Retry with imageUrl
-            payload_base["imageUrl"] = upload_result["image_url"]
-            payload_base.pop("imageBase64", None)
-            payload_base.pop("imageName", None)
-            init = await try_initiate(payload_base)
-            method_used = f"upload_{upload_result['method']}"
-
-    # ── Strategy C: Multipart to generate endpoint ──
-    if not init["success"]:
-        for model in WORKING_MODELS:
-            files = {"image": (filename, image_bytes, content_type)}
-            data = {
-                "toolPrompt": "Edit the attached photo",
-                "userPrompt": prompt,
-                "quality": quality,
-                "model": model,
-                "tool[slug]": "ai-photo-editor",
-                "tool[graphicType]": "element",
-                "tool[from]": "/ai-photo-editor__ai-photo-editor",
-                "tool[isPanelCall]": "false",
-            }
-            res = await post_multipart(GENERATE_URL, files, data)
-            if res.get("status") in (200, 201):
-                resp_data = res.get("data", {})
-                aid = (
-                    resp_data.get("activityId")
-                    or resp_data.get("data", {}).get("activityId")
-                    or resp_data.get("id")
-                )
-                if aid:
-                    init = {"success": True, "model_used": model, "activity_id": aid}
-                    method_used = "multipart_generate"
-                    break
-
-    if not init["success"]:
-        raise HTTPException(502, {
-            "error": "All edit strategies failed",
-            "last_error": init.get("last_error"),
-            "hint": "Try /api/discover-upload to find working upload endpoint",
-        })
-
-    JOBS[init["activity_id"]] = {
-        "prompt": prompt, "model": init["model_used"], "tool": "edit",
-        "method": method_used,
-        "started": datetime.now(timezone.utc).isoformat(),
-    }
-
-    final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
-    if not final["success"]:
-        raise HTTPException(500, final.get("message", "Edit failed"))
-
-    JOBS[init["activity_id"]]["image_url"] = final["image_url"]
+    if not result["success"]:
+        raise HTTPException(500, result)
 
     return {
         "success": True,
         "tool": "edit",
         "prompt": prompt,
-        "model_used": init["model_used"],
-        "method": method_used,
-        "image_url": final["image_url"],
-        "all_urls": final["all_urls"],
-        "activity_id": init["activity_id"],
-        "time_taken_seconds": final["time_taken"],
+        "image_url": result["image_url"],
+        "all_urls": result["all_urls"],
+        "uploaded_image_url": result.get("uploaded_image_url"),
+        "workspace_id": result.get("workspace_id"),
+        "activity_id": result["activity_id"],
+        "model_used": result.get("model_used"),
+        "time_taken_seconds": result.get("time_taken_seconds"),
     }
 
 
 # ==================================================================
-# ============ EDIT via Image URL ================================
+# ============ EDIT FROM URL =====================================
 # ==================================================================
 @app.get("/api/edit-url", tags=["Edit"])
 async def edit_url(
-    image_url: str = Query(..., description="Public URL of image to edit"),
-    prompt: str = Query(..., description="Edit instructions"),
+    image_url: str = Query(...),
+    prompt: str = Query(...),
     quality: str = Query("low"),
     max_wait: int = Query(90, ge=10, le=120),
 ):
-    """Edit image from a URL (no file upload)."""
+    """Edit image from public URL."""
     payload_base = {
         "toolPrompt": "Edit the attached photo",
         "userPrompt": prompt,
@@ -499,7 +578,14 @@ async def edit_url(
 
     init = await try_initiate(payload_base)
     if not init["success"]:
-        raise HTTPException(502, {"error": "Initiate failed", "details": init.get("last_error")})
+        # Try with references
+        payload_base["references"] = [image_url]
+        payload_base["referencesCount"] = 1
+        payload_base.pop("imageUrl", None)
+        init = await try_initiate(payload_base)
+
+    if not init["success"]:
+        raise HTTPException(502, {"error": "Initiate failed", "detail": init.get("last_error")})
 
     final = await wait_for_image(init["activity_id"], max_seconds=max_wait)
     if not final["success"]:
@@ -524,24 +610,14 @@ async def check_status(activity_id: str):
     res = await get_status(activity_id)
     if res.get("status") != 200:
         raise HTTPException(502, "Status check failed")
-
     data = res.get("data", {})
     inner = data.get("data", {})
     urls = inner.get("urls", []) or data.get("urls", [])
-    status = data.get("status")
-
-    if status == "completed" and urls:
-        return {
-            "success": True,
-            "status": "completed",
-            "image_url": urls[0],
-            "all_urls": urls,
-        }
     return {
         "success": True,
-        "status": status,
-        "prompt": inner.get("userPrompt"),
-        "urls": urls,
+        "status": data.get("status"),
+        "image_url": urls[0] if urls else None,
+        "all_urls": urls,
     }
 
 
